@@ -1,0 +1,11 @@
+# Secret Keys and Environment Variables
+firebase-key.json
+.env
+
+# Python specific files to ignore
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.pytest_cache/
