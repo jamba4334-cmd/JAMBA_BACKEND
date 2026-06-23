@@ -138,11 +138,10 @@ def create_order():
         shipping_fee = 149 if secure_subtotal < 1999 else 0
         final_total = secure_subtotal + shipping_fee
 
-        # 🔥 NEW: GENERATE THE CUSTOM UNIQUE ORDER ID (e.g. JB260623143005)
         unique_jamba_id = "JB" + datetime.now().strftime("%y%m%d%H%M%S")
 
         order_data = {
-            "jamba_order_id": unique_jamba_id, # INJECTED HERE
+            "jamba_order_id": unique_jamba_id,
             "email": customer_email,
             "items": enriched_cart,
             "subtotal": secure_subtotal,
@@ -234,10 +233,7 @@ def admin_products():
             limit = int(request.args.get("limit", 50))
             products = []
             docs = db.collection("products").order_by("created_at", direction=firestore.Query.DESCENDING).limit(limit).get()
-            
-            for doc in docs:
-                products.append({**doc.to_dict(), "docId": doc.id})
-                
+            for doc in docs: products.append({**doc.to_dict(), "docId": doc.id})
             return jsonify(products), 200
         except Exception as e:
             logger.error(f"Failed to fetch products: {e}")
@@ -248,7 +244,6 @@ def admin_products():
             data = request.get_json()
             data["created_at"] = datetime.utcnow().isoformat()
             _, doc_ref = db.collection("products").add(data)
-            logger.info(f"Product added by admin: {doc_ref.id}")
             return jsonify({"status": "success", "id": doc_ref.id}), 201
         except Exception as e:
             logger.error(f"Failed to create product: {e}")
@@ -263,19 +258,15 @@ def admin_product_detail(doc_id):
     if request.method == "PUT":
         try:
             doc_ref.update(request.get_json())
-            logger.info(f"Product updated: {doc_id}")
             return jsonify({"status": "success"}), 200
         except Exception as e:
-            logger.error(f"Failed to update product {doc_id}: {e}")
             return jsonify({"error": "Update failed"}), 500
 
     if request.method == "DELETE":
         try:
             doc_ref.delete()
-            logger.info(f"Product deleted: {doc_id}")
             return jsonify({"status": "success"}), 200
         except Exception as e:
-            logger.error(f"Failed to delete product {doc_id}: {e}")
             return jsonify({"error": "Deletion failed"}), 500
 
 @app.route("/admin/orders", methods=["GET"])
@@ -286,13 +277,9 @@ def admin_orders():
         limit = int(request.args.get("limit", 50))
         orders = []
         docs = db.collection("orders").order_by("created_at", direction=firestore.Query.DESCENDING).limit(limit).get()
-        
-        for doc in docs:
-            orders.append({**doc.to_dict(), "id": doc.id})
-            
+        for doc in docs: orders.append({**doc.to_dict(), "id": doc.id})
         return jsonify(orders), 200
     except Exception as e:
-        logger.error(f"Failed to fetch orders: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/admin/orders/<order_id>", methods=["PUT"])
@@ -301,10 +288,8 @@ def update_order(order_id):
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     try:
         db.collection("orders").document(order_id).update(request.get_json())
-        logger.info(f"Order {order_id} updated")
         return jsonify({"status": "success"}), 200
     except Exception as e:
-        logger.error(f"Failed to update order {order_id}: {e}")
         return jsonify({"error": "Update failed"}), 500
 
 @app.route("/admin/customers", methods=["GET"])
@@ -315,14 +300,116 @@ def admin_customers():
         limit = int(request.args.get("limit", 50))
         customers = []
         docs = db.collection("users").limit(limit).get()
-        
-        for doc in docs:
-            customers.append({**doc.to_dict(), "id": doc.id})
-            
+        for doc in docs: customers.append({**doc.to_dict(), "id": doc.id})
         return jsonify(customers), 200
-    except Exception as e:
-        logger.error(f"Failed to fetch customers: {e}")
+     except Exception as e:
         return jsonify({"error": "Internal server error"}), 500
+
+
+# 🔥 NEW: CMS & TRIBE SETTINGS ROUTES
+@app.route("/admin/settings/<doc_id>", methods=["GET", "PUT"])
+@admin_required
+def admin_settings(doc_id):
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    if request.method == "GET":
+        try:
+            doc = db.collection("settings").document(doc_id).get()
+            return jsonify(doc.to_dict() if doc.exists else {}), 200
+        except Exception as e:
+            return jsonify({"error": "Failed to load settings"}), 500
+            
+    if request.method == "PUT":
+        try:
+            data = request.get_json()
+            db.collection("settings").document(doc_id).set(data, merge=True)
+            return jsonify({"status": "Settings updated"}), 200
+        except Exception as e:
+            return jsonify({"error": "Update failed"}), 500
+
+# 🔥 NEW: SELLER DIRECTORY ROUTES
+@app.route("/admin/sellers", methods=["GET", "POST"])
+@admin_required
+def admin_sellers():
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    if request.method == "GET":
+        try:
+            sellers = []
+            docs = db.collection("authorized_sellers").get()
+            for doc in docs: sellers.append({**doc.to_dict(), "id": doc.id})
+            return jsonify(sellers), 200
+        except Exception as e:
+            return jsonify({"error": "Internal error"}), 500
+            
+    if request.method == "POST":
+        try:
+            data = request.get_json()
+            email = data.get("email")
+            db.collection("authorized_sellers").document(email).set({
+                "email": email,
+                "addedAt": datetime.utcnow().isoformat(),
+                "addedBy": ALLOWED_ADMIN_EMAIL
+            })
+            return jsonify({"status": "Seller authorized"}), 201
+        except Exception as e:
+            return jsonify({"error": "Failed to authorize seller"}), 500
+
+@app.route("/admin/sellers/<email>", methods=["DELETE"])
+@admin_required
+def remove_seller(email):
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    try:
+        db.collection("authorized_sellers").document(email).delete()
+        return jsonify({"status": "Seller removed"}), 200
+    except Exception as e:
+        return jsonify({"error": "Failed to remove seller"}), 500
+
+@app.route("/admin/seller_profiles/<email>", methods=["GET", "PUT"])
+@admin_required
+def manage_seller_profile(email):
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    if request.method == "GET":
+        try:
+            doc = db.collection("seller_profiles").document(email).get()
+            return jsonify(doc.to_dict() if doc.exists else {}), 200
+        except Exception as e:
+            return jsonify({"error": "Failed"}), 500
+    if request.method == "PUT":
+        try:
+            data = request.get_json()
+            db.collection("seller_profiles").document(email).set(data, merge=True)
+            return jsonify({"status": "Profile updated"}), 200
+        except Exception as e:
+            return jsonify({"error": "Failed"}), 500
+
+# 🔥 NEW: PAYOUT MANAGEMENT ROUTES
+@app.route("/admin/payouts", methods=["GET"])
+@admin_required
+def admin_payouts():
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    try:
+        status_filter = request.args.get("status")
+        email_filter = request.args.get("email")
+        
+        query = db.collection("payout_requests")
+        if status_filter: query = query.where("status", "==", status_filter)
+        if email_filter: query = query.where("email", "==", email_filter)
+        
+        docs = query.get()
+        payouts = [{**doc.to_dict(), "id": doc.id} for doc in docs]
+        return jsonify(payouts), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/admin/payouts/<payout_id>", methods=["PUT"])
+@admin_required
+def update_payout(payout_id):
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    try:
+        data = request.get_json()
+        db.collection("payout_requests").document(payout_id).update(data)
+        return jsonify({"status": "Payout updated"}), 200
+    except Exception as e:
+        return jsonify({"error": "Failed"}), 500
 
 # ==========================================
 # 7. RUN THE SERVER
