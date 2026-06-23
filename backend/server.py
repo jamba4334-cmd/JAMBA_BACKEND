@@ -16,7 +16,6 @@ from firebase_admin import credentials, firestore, auth as firebase_auth
 # ==========================================
 # 2. CONFIGURATION & LOGGING SETUP
 # ==========================================
-# Industry Standard: Configure robust logging instead of print()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -26,12 +25,9 @@ logger = logging.getLogger("jambawear_api")
 
 app = Flask(__name__)
 
-# Industry Standard: Restrict CORS in production
-# Update this to your actual Vercel/Netlify React URL before going live
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}})
 
-# Admin Email from your React Code
 ALLOWED_ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "jamba4334@gmail.com")
 
 # ==========================================
@@ -63,10 +59,6 @@ except Exception as e:
 # 4. SECURITY MIDDLEWARE
 # ==========================================
 def admin_required(f):
-    """
-    Validates the Firebase Auth Token sent by the React frontend.
-    Ensures only the true admin can access these routes.
-    """
     @wraps(f)
     def decorated_function(*args, **kwargs):
         auth_header = request.headers.get("Authorization")
@@ -76,14 +68,10 @@ def admin_required(f):
         
         token = auth_header.split(" ")[1]
         try:
-            # Verify the token with Firebase
             decoded_token = firebase_auth.verify_id_token(token)
-            
-            # Verify it belongs to the admin
             if decoded_token.get("email") != ALLOWED_ADMIN_EMAIL:
                 logger.warning(f"Forbidden access attempt by: {decoded_token.get('email')}")
                 return jsonify({"error": "Forbidden: Insufficient permissions"}), 403
-                
         except Exception as e:
             logger.error(f"Token verification failed: {str(e)}")
             return jsonify({"error": "Unauthorized: Invalid or expired token"}), 401
@@ -120,14 +108,12 @@ def create_order():
         secure_subtotal = 0
         enriched_cart = []
 
-        # Validate pricing against the database (Trust Server, Not Client)
         for item in cart:
             item_id = str(item.get("id"))
             quantity = int(item.get("quantity", 1))
             
             doc_ref = db.collection("products").document(item_id).get()
             if not doc_ref.exists:
-                # Fallback to query if item_id isn't the document ID
                 query = db.collection("products").where("item_id", "==", item_id).limit(1).get()
                 if not query:
                     return jsonify({"error": f"Product {item_id} out of stock or invalid."}), 400
@@ -138,7 +124,6 @@ def create_order():
             real_price = float(product.get("selling_price", 0))
             secure_subtotal += real_price * quantity
             
-            # Rebuild the item with trusted server data
             item.update({
                 "price": real_price,
                 "brandName": product.get("brandName", ""),
@@ -153,7 +138,11 @@ def create_order():
         shipping_fee = 149 if secure_subtotal < 1999 else 0
         final_total = secure_subtotal + shipping_fee
 
+        # 🔥 NEW: GENERATE THE CUSTOM UNIQUE ORDER ID (e.g. JB260623143005)
+        unique_jamba_id = "JB" + datetime.now().strftime("%y%m%d%H%M%S")
+
         order_data = {
+            "jamba_order_id": unique_jamba_id, # INJECTED HERE
             "email": customer_email,
             "items": enriched_cart,
             "subtotal": secure_subtotal,
@@ -165,14 +154,12 @@ def create_order():
             "created_at": datetime.utcnow().isoformat(),
         }
 
-        # Handle COD
         if payment_method == "COD":
             order_data["order_id"] = f"cod_{int(datetime.now().timestamp())}"
             db.collection("orders").add(order_data)
-            logger.info(f"COD Order created: {order_data['order_id']}")
-            return jsonify({"status": "success", "payment_method": "COD", "order_id": order_data["order_id"]}), 201
+            logger.info(f"COD Order created: {order_data['jamba_order_id']}")
+            return jsonify({"status": "success", "payment_method": "COD", "order_id": order_data["jamba_order_id"]}), 201
 
-        # Handle Razorpay
         if not razorpay_client:
             return jsonify({"error": "Payment gateway unavailable"}), 503
 
@@ -184,7 +171,7 @@ def create_order():
 
         order_data["razorpay_order_id"] = razorpay_order["id"]
         db.collection("orders").add(order_data)
-        logger.info(f"Razorpay Order created: {razorpay_order['id']}")
+        logger.info(f"Razorpay Order created: {unique_jamba_id}")
         
         return jsonify(razorpay_order), 201
 
@@ -244,9 +231,7 @@ def admin_products():
     
     if request.method == "GET":
         try:
-            # Dynamic Pagination: Allows frontend to pass ?limit=100
             limit = int(request.args.get("limit", 50))
-            
             products = []
             docs = db.collection("products").order_by("created_at", direction=firestore.Query.DESCENDING).limit(limit).get()
             
