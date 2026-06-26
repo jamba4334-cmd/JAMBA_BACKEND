@@ -190,12 +190,12 @@ def verify_payment():
         data = request.get_json()
 
         razorpay_order_id = data.get("razorpay_order_id")
-        razorpay_payment_id = data.get("razorpay_payment_id")
+        rose_payment_id = data.get("razorpay_payment_id")
         razorpay_signature = data.get("razorpay_signature")
 
         razorpay_client.utility.verify_payment_signature({
             "razorpay_order_id": razorpay_order_id,
-            "razorpay_payment_id": razorpay_payment_id,
+            "razorpay_payment_id": rose_payment_id,
             "razorpay_signature": razorpay_signature,
         })
 
@@ -207,7 +207,7 @@ def verify_payment():
             doc_id = orders_ref[0].id
             db.collection("orders").document(doc_id).update({
                 "status": "paid",
-                "payment_id": razorpay_payment_id,
+                "payment_id": rose_payment_id,
             })
 
         return jsonify({"status": "Payment verified and saved!"}), 200
@@ -302,7 +302,7 @@ def admin_customers():
         docs = db.collection("users").limit(limit).get()
         for doc in docs: customers.append({**doc.to_dict(), "id": doc.id})
         return jsonify(customers), 200
-     except Exception as e:
+    except Exception as e:
         return jsonify({"error": "Internal server error"}), 500
 
 
@@ -311,16 +311,25 @@ def admin_customers():
 @admin_required
 def admin_settings(doc_id):
     if db is None: return jsonify({"error": "Database unavailable"}), 503
+    
     if request.method == "GET":
         try:
             doc = db.collection("settings").document(doc_id).get()
-            return jsonify(doc.to_dict() if doc.exists else {}), 200
+            if doc.exists:
+                return jsonify(doc.to_dict()), 200
+            else:
+                # Fallback structure if the frontend expects empty array structure initialized
+                if doc_id == "tribe_categories":
+                    return jsonify({"tribes": []}), 200
+                return jsonify({}), 200
         except Exception as e:
             return jsonify({"error": "Failed to load settings"}), 500
             
     if request.method == "PUT":
         try:
             data = request.get_json()
+            if doc_id == "tribe_categories":
+                data["last_updated"] = datetime.utcnow().isoformat()
             db.collection("settings").document(doc_id).set(data, merge=True)
             return jsonify({"status": "Settings updated"}), 200
         except Exception as e:
