@@ -305,7 +305,6 @@ def admin_customers():
     except Exception as e:
         return jsonify({"error": "Internal server error"}), 500
 
-
 # 🔥 NEW: CMS & TRIBE SETTINGS ROUTES
 @app.route("/admin/settings/<doc_id>", methods=["GET", "PUT"])
 @admin_required
@@ -404,25 +403,4 @@ def admin_payouts():
         if email_filter: query = query.where("email", "==", email_filter)
         
         docs = query.get()
-        payouts = [{**doc.to_dict(), "id": doc.id} for doc in docs]
-        return jsonify(payouts), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/admin/payouts/<payout_id>", methods=["PUT"])
-@admin_required
-def update_payout(payout_id):
-    if db is None: return jsonify({"error": "Database unavailable"}), 503
-    try:
-        data = request.get_json()
-        db.collection("payout_requests").document(payout_id).update(data)
-        return jsonify({"status": "Payout updated"}), 200
-    except Exception as e:
-        return jsonify({"error": "Failed"}), 500
-
-# ==========================================
-# 7. RUN THE SERVER
-# ==========================================
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+        payouts = [{**doc.to_dict(), "id
