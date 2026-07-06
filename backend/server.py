@@ -107,6 +107,9 @@ def create_order():
 
         secure_subtotal = 0
         enriched_cart = []
+        
+        # 🔥 ADDED: Track unique seller emails to save at the top level of the order
+        seller_emails_set = set()
 
         for item in cart:
             item_id = str(item.get("id"))
@@ -124,11 +127,16 @@ def create_order():
             real_price = float(product.get("selling_price", 0))
             secure_subtotal += real_price * quantity
             
+            # 🔥 ADDED: Extract the seller email and add it to our secure set
+            seller_email = product.get("sellerEmail", "")
+            if seller_email:
+                seller_emails_set.add(seller_email)
+            
             item.update({
                 "price": real_price,
                 "brandName": product.get("brandName", ""),
                 "sellerName": product.get("sellerName", ""),
-                "sellerEmail": product.get("sellerEmail", "")
+                "sellerEmail": seller_email
             })
             enriched_cart.append(item)
 
@@ -151,6 +159,9 @@ def create_order():
             "payment_method": payment_method,
             "shippingAddress": shipping_address,
             "created_at": datetime.utcnow().isoformat(),
+            
+            # 🔥 ADDED: Save the array of seller emails to Firebase so Seller.jsx can find it securely!
+            "sellerEmails": list(seller_emails_set)
         }
 
         if payment_method == "COD":
