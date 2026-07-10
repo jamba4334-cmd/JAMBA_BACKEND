@@ -317,7 +317,7 @@ def admin_customers():
         return jsonify({"error": "Internal server error"}), 500
 
 
-# 🔥 NEW: CMS & TRIBE SETTINGS ROUTES
+# 🔥 TRIBE SETTINGS ROUTES
 @app.route("/admin/settings/<doc_id>", methods=["GET", "PUT"])
 @admin_required
 def admin_settings(doc_id):
@@ -329,7 +329,6 @@ def admin_settings(doc_id):
             if doc.exists:
                 return jsonify(doc.to_dict()), 200
             else:
-                # Fallback structure if the frontend expects empty array structure initialized
                 if doc_id == "tribe_categories":
                     return jsonify({"tribes": []}), 200
                 return jsonify({}), 200
@@ -346,7 +345,7 @@ def admin_settings(doc_id):
         except Exception as e:
             return jsonify({"error": "Update failed"}), 500
 
-# 🔥 NEW: SELLER DIRECTORY ROUTES
+# 🔥 SELLER DIRECTORY ROUTES
 @app.route("/admin/sellers", methods=["GET", "POST"])
 @admin_required
 def admin_sellers():
@@ -401,7 +400,9 @@ def manage_seller_profile(email):
         except Exception as e:
             return jsonify({"error": "Failed"}), 500
 
-# 🔥 NEW: PAYOUT MANAGEMENT ROUTES
+# ==========================================
+# 🔥 NEW & UPDATED: FINANCE & EARNINGS ROUTES
+# ==========================================
 @app.route("/admin/payouts", methods=["GET"])
 @admin_required
 def admin_payouts():
@@ -420,16 +421,91 @@ def admin_payouts():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/admin/finance/kpis", methods=["GET"])
+@admin_required
+def admin_finance_kpis():
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    try:
+        # 1. Pending Payouts (Money owed to sellers)
+        payouts_query = db.collection("payout_requests").where("status", "==", "pending").get()
+        pending_payouts = sum([float(doc.to_dict().get("amount", doc.to_dict().get("netPayable", 0))) for doc in payouts_query])
+
+        # 2. Escrow (Orders paid but not yet cleared/settled)
+        orders_query = db.collection("orders").where("status", "==", "paid").get()
+        in_escrow = sum([float(doc.to_dict().get("total", 0)) for doc in orders_query])
+
+        # 3. Platform Revenue & GST
+        # Calculating realized revenue from successfully paid out settlements
+        settled_query = db.collection("payout_requests").where("status", "==", "paid").get()
+        jamba_revenue = sum([float(doc.to_dict().get("jambaFee", 0)) for doc in settled_query])
+        
+        # Statutory 18% GST on the platform service fee
+        total_gst = jamba_revenue * 0.18
+
+        return jsonify({
+            "jambaRevenue": round(jamba_revenue, 2),
+            "pendingPayouts": round(pending_payouts, 2),
+            "inEscrow": round(in_escrow, 2),
+            "totalGST": round(total_gst, 2)
+        }), 200
+    except Exception as e:
+        logger.error(f"Error calculating KPIs: {e}")
+        return jsonify({"error": "Failed to calculate KPIs"}), 500
+
+@app.route("/admin/transactions", methods=["GET"])
+@admin_required
+def admin_transactions():
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    try:
+        limit = int(request.args.get("limit", 100))
+        docs = db.collection("transactions").order_by("created_at", direction=firestore.Query.DESCENDING).limit(limit).get()
+        transactions = [{**doc.to_dict(), "id": doc.id} for doc in docs]
+        return jsonify(transactions), 200
+    except Exception as e:
+        logger.error(f"Error fetching transactions: {e}")
+        return jsonify({"error": "Failed to load ledger"}), 500
+
+# 🔥 UPGRADED: Replaces the existing PUT route to auto-generate a ledger entry
 @app.route("/admin/payouts/<payout_id>", methods=["PUT"])
 @admin_required
 def update_payout(payout_id):
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     try:
         data = request.get_json()
-        db.collection("payout_requests").document(payout_id).update(data)
-        return jsonify({"status": "Payout updated"}), 200
+        
+        # 1. Update the payout request status and UTR
+        payout_ref = db.collection("payout_requests").document(payout_id)
+        payout_doc = payout_ref.get()
+        
+        if not payout_doc.exists:
+            return jsonify({"error": "Payout not found"}), 404
+            
+        payout_ref.update(data)
+        
+        # 2. Automatically generate an immutable Ledger Transaction
+        if data.get("status") == "paid":
+            payout_info = payout_doc.to_dict()
+            
+            # Handle potential variations in how the frontend passed the amount
+            amount = payout_info.get("amount", payout_info.get("netPayable", 0))
+            brand = payout_info.get("brand", payout_info.get("sellerName", "Unknown Seller"))
+            utr = data.get("utr", "N/A")
+            
+            db.collection("transactions").add({
+                "txId": f"TXN-{int(datetime.utcnow().timestamp())}",
+                "date": datetime.utcnow().strftime("%d %b %Y"),
+                "created_at": datetime.utcnow().isoformat(),
+                "type": "Payout",
+                "brand": brand,
+                "amount": f"- ₹{amount}",
+                "status": f"Paid (UTR: {utr})",
+                "payout_id": payout_id
+            })
+
+        return jsonify({"status": "Payout updated and ledger recorded"}), 200
     except Exception as e:
-        return jsonify({"error": "Failed"}), 500
+        logger.error(f"Error updating payout: {e}")
+        return jsonify({"error": "Failed to update payout"}), 500
 
 # ==========================================
 # 7. RUN THE SERVER
