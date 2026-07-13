@@ -320,6 +320,22 @@ def remove_seller(email):
     db.collection("authorized_sellers").document(email).delete()
     return jsonify({"status": "Seller removed"}), 200
 
+# 🔥 NEW ROUTE: Fetch and update the seller's profile details
+@app.route("/admin/seller_profiles/<email>", methods=["GET", "PUT"])
+@admin_required
+def admin_seller_profile(email):
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    
+    if request.method == "GET":
+        doc = db.collection("seller_profiles").document(email).get()
+        return jsonify(doc.to_dict() if doc.exists else {}), 200
+        
+    if request.method == "PUT":
+        data = request.get_json()
+        data["updated_at"] = datetime.utcnow().isoformat()
+        db.collection("seller_profiles").document(email).set(data, merge=True)
+        return jsonify({"status": "Profile updated"}), 200
+
 # ==========================================
 # 7. ADMIN FINANCE, LEDGERS & GOD-MODE
 # ==========================================
@@ -328,8 +344,14 @@ def remove_seller(email):
 def admin_payouts():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     status_filter = request.args.get("status")
+    email_filter = request.args.get("email")
+    
     query = db.collection("payout_requests")
-    if status_filter: query = query.where("status", "==", status_filter)
+    if status_filter: 
+        query = query.where("status", "==", status_filter)
+    if email_filter:
+        query = query.where("email", "==", email_filter)
+        
     payouts = [{**doc.to_dict(), "id": doc.id} for doc in query.get()]
     return jsonify(payouts), 200
 
