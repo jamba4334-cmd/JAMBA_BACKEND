@@ -427,118 +427,115 @@ def update_payout(payout_id):
     return jsonify({"status": "Payout updated and ledger recorded"}), 200
 
 # ==========================================
-# 8. SELLER FINANCE & PAYOUT ROUTES (SECURE)
+# 8. SELLER FINANCE & PAYOUT ROUTES (SECURE PIPELINE)
 # ==========================================
-@app.route("/seller/finance", methods=["GET"])
+@app.route("/api/v1/seller/dashboard", methods=["GET"])
 @seller_required
-def seller_finance():
+def get_isolated_seller_data():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     try:
-        email = request.seller_email
+        current_seller_email = request.seller_email 
         
-        # 1. Get Payout History
-        payouts_query = db.collection("payout_requests").where("email", "==", email).get()
-        payout_history = []
-        withdrawn = 0
-        pending_requests = 0
+        # Macro Query
+        orders_query = db.collection("orders").where("sellerEmails", "array_contains", current_seller_email).get()
         
-        for doc in payouts_query:
-            data = doc.to_dict()
-            data["id"] = doc.id
-            payout_history.append(data)
-            amt = float(data.get("amount", data.get("netPayable", 0)))
-            if data.get("status") == "paid": withdrawn += amt
-            elif data.get("status") == "pending": pending_requests += amt
-        
-        # 2. Calculate Earnings & Extract Secure Itemized Sales
-        orders_query = db.collection("orders").where("sellerEmails", "array_contains", email).get()
-        total_escrow = 0
-        total_unlocked = 0
-        
-        itemized_sales = [] 
+        secure_wallet = {"available": 0, "pending": 0, "lifetime": 0}
+        isolated_sales_ledger = []
         
         for doc in orders_query:
             order = doc.to_dict()
-            status = order.get("status", "pending")
+            order_status = order.get("status", "pending")
             
-            if status not in ["paid", "delivered", "settled_override"]: 
+            if order_status not in ["paid", "delivered", "settled_override"]: 
                 continue
                 
-            seller_items_total = 0
-            
+            # Micro Filter
             for item in order.get("items", []):
-                if item.get("sellerEmail") == email:
-                    item_gross = float(item.get("price", 0)) * int(item.get("quantity", 1))
-                    seller_items_total += item_gross
+                if item.get("sellerEmail") == current_seller_email:
+                    gross_item_revenue = float(item.get("price", 0)) * int(item.get("quantity", 1))
+                    jamba_fee = gross_item_revenue * 0.30
+                    net_seller_earnings = gross_item_revenue - jamba_fee
                     
-                    itemized_sales.append({
+                    isolated_sales_ledger.append({
                         "order_id": order.get("jamba_order_id", "N/A"),
-                        "date": order.get("created_at", datetime.utcnow().isoformat()),
-                        "title": item.get("name", item.get("title", "Product")),
+                        "date": order.get("created_at"),
+                        "product_name": item.get("name", item.get("title", "Product")),
                         "qty": int(item.get("quantity", 1)),
-                        "gross": item_gross,
-                        "jamba_fee": round(item_gross * 0.30, 2),
-                        "net": round(item_gross * 0.70, 2),
-                        "status": "Escrow" if status == "paid" else "Unlocked"
+                        "gross": round(gross_item_revenue, 2),
+                        "fee": round(jamba_fee, 2),
+                        "net": round(net_seller_earnings, 2),
+                        "status": order_status
                     })
-            
-            seller_net = seller_items_total * 0.70
-            
-            if status in ["delivered", "settled_override"]:
-                total_unlocked += seller_net
-            elif status == "paid":
-                total_escrow += seller_net
+                    
+                    if order_status in ["delivered", "settled_override"]:
+                        secure_wallet["available"] += net_seller_earnings
+                    elif order_status == "paid":
+                        secure_wallet["pending"] += net_seller_earnings
+                    
+                    secure_wallet["lifetime"] += net_seller_earnings
 
-        available = total_unlocked - withdrawn - pending_requests
-        if available < 0: available = 0
-        
-        payout_history.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-        itemized_sales.sort(key=lambda x: x.get("date", ""), reverse=True)
+        # Subtract withdrawn payouts
+        payouts_query = db.collection("payout_requests").where("email", "==", current_seller_email).get()
+        for doc in payouts_query:
+            amt = float(doc.to_dict().get("amount", 0))
+            if doc.to_dict().get("status") in ["paid", "pending"]:
+                secure_wallet["available"] -= amt
+            
+        if secure_wallet["available"] < 0: secure_wallet["available"] = 0
+        isolated_sales_ledger.sort(key=lambda x: x.get("date", ""), reverse=True)
 
         return jsonify({
             "wallet": {
-                "pending": round(total_escrow, 2),
-                "available": round(available, 2),
-                "withdrawn": round(withdrawn, 2)
+                "available": round(secure_wallet["available"], 2),
+                "pending": round(secure_wallet["pending"], 2),
+                "lifetime": round(secure_wallet["lifetime"], 2)
             },
-            "history": payout_history,
-            "sales": itemized_sales 
+            "sales_ledger": isolated_sales_ledger
         }), 200
     except Exception as e:
-        logger.error(f"Error fetching seller finance: {e}")
-        return jsonify({"error": "Failed to load financial data"}), 500
+        logger.error(f"Pipeline error: {e}")
+        return jsonify({"error": "Failed to securely route financial data"}), 500
 
-@app.route("/seller/payouts/request", methods=["POST"])
+
+@app.route("/api/v1/seller/payouts/history", methods=["GET"])
+@seller_required
+def get_payout_history():
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    try:
+        payouts_query = db.collection("payout_requests").where("email", "==", request.seller_email).get()
+        history = [{**doc.to_dict(), "id": doc.id} for doc in payouts_query]
+        history.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        return jsonify(history), 200
+    except Exception as e: 
+        logger.error(f"History error: {e}")
+        return jsonify({"error": "Failed to load history"}), 500
+
+
+@app.route("/api/v1/seller/payouts/request", methods=["POST"])
 @seller_required
 def request_payout():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     try:
-        email = request.seller_email
         data = request.get_json()
         amount = float(data.get("amount", 0))
-        brand = data.get("brand", "Unknown Brand")
-        
         if amount <= 0: return jsonify({"error": "Invalid payout amount"}), 400
             
-        net_payable = amount
         gross_amount = round(amount / 0.7, 2)
-        
-        new_payout = {
-            "email": email,
-            "brand": brand,
-            "amount": net_payable,      
-            "netPayable": net_payable,   
+        _, doc_ref = db.collection("payout_requests").add({
+            "email": request.seller_email,
+            "brand": data.get("brand", "Unknown Brand"),
+            "amount": amount,      
+            "netPayable": amount,   
             "grossAmount": gross_amount,
-            "jambaFee": round(gross_amount - net_payable, 2),
+            "jambaFee": round(gross_amount - amount, 2),
             "deductions": 0,
             "status": "pending",
             "created_at": datetime.utcnow().isoformat(),
             "utr": ""
-        }
-        
-        _, doc_ref = db.collection("payout_requests").add(new_payout)
+        })
         return jsonify({"status": "success", "id": doc_ref.id}), 201
-    except Exception as e:
+    except Exception as e: 
+        logger.error(f"Request error: {e}")
         return jsonify({"error": "Failed to process request"}), 500
 
 # ==========================================
