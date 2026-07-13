@@ -427,7 +427,7 @@ def update_payout(payout_id):
     return jsonify({"status": "Payout updated and ledger recorded"}), 200
 
 # ==========================================
-# 8. SELLER FINANCE & PAYOUT ROUTES
+# 8. SELLER FINANCE & PAYOUT ROUTES (SECURE)
 # ==========================================
 @app.route("/seller/finance", methods=["GET"])
 @seller_required
@@ -450,20 +450,37 @@ def seller_finance():
             if data.get("status") == "paid": withdrawn += amt
             elif data.get("status") == "pending": pending_requests += amt
         
-        # 2. Calculate Earnings
+        # 2. Calculate Earnings & Extract Secure Itemized Sales
         orders_query = db.collection("orders").where("sellerEmails", "array_contains", email).get()
         total_escrow = 0
         total_unlocked = 0
         
+        itemized_sales = [] 
+        
         for doc in orders_query:
             order = doc.to_dict()
             status = order.get("status", "pending")
-            if status not in ["paid", "delivered", "settled_override"]: continue
+            
+            if status not in ["paid", "delivered", "settled_override"]: 
+                continue
                 
             seller_items_total = 0
+            
             for item in order.get("items", []):
                 if item.get("sellerEmail") == email:
-                    seller_items_total += (float(item.get("price", 0)) * int(item.get("quantity", 1)))
+                    item_gross = float(item.get("price", 0)) * int(item.get("quantity", 1))
+                    seller_items_total += item_gross
+                    
+                    itemized_sales.append({
+                        "order_id": order.get("jamba_order_id", "N/A"),
+                        "date": order.get("created_at", datetime.utcnow().isoformat()),
+                        "title": item.get("name", item.get("title", "Product")),
+                        "qty": int(item.get("quantity", 1)),
+                        "gross": item_gross,
+                        "jamba_fee": round(item_gross * 0.30, 2),
+                        "net": round(item_gross * 0.70, 2),
+                        "status": "Escrow" if status == "paid" else "Unlocked"
+                    })
             
             seller_net = seller_items_total * 0.70
             
@@ -474,7 +491,9 @@ def seller_finance():
 
         available = total_unlocked - withdrawn - pending_requests
         if available < 0: available = 0
+        
         payout_history.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        itemized_sales.sort(key=lambda x: x.get("date", ""), reverse=True)
 
         return jsonify({
             "wallet": {
@@ -482,9 +501,11 @@ def seller_finance():
                 "available": round(available, 2),
                 "withdrawn": round(withdrawn, 2)
             },
-            "history": payout_history
+            "history": payout_history,
+            "sales": itemized_sales 
         }), 200
     except Exception as e:
+        logger.error(f"Error fetching seller finance: {e}")
         return jsonify({"error": "Failed to load financial data"}), 500
 
 @app.route("/seller/payouts/request", methods=["POST"])
