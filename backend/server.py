@@ -304,9 +304,19 @@ def admin_settings(doc_id):
 @admin_required
 def admin_sellers():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
+    
     if request.method == "GET":
-        sellers = [{**doc.to_dict(), "id": doc.id} for doc in db.collection("authorized_sellers").get()]
+        sellers = []
+        for doc in db.collection("authorized_sellers").get():
+            seller_data = {**doc.to_dict(), "id": doc.id}
+            
+            # Fetch profile directly on the backend to prevent frontend API spam
+            prof_doc = db.collection("seller_profiles").document(doc.id).get()
+            seller_data["profile"] = prof_doc.to_dict() if prof_doc.exists else {}
+            
+            sellers.append(seller_data)
         return jsonify(sellers), 200
+        
     if request.method == "POST":
         email = request.get_json().get("email")
         db.collection("authorized_sellers").document(email).set({
