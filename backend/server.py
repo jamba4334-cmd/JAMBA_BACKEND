@@ -9,9 +9,14 @@ from functools import wraps
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from dotenv import load_dotenv
+
 import razorpay
 import firebase_admin
 from firebase_admin import credentials, firestore, auth as firebase_auth
+
+# 🔥 NEW: Load environment variables from the .env file
+load_dotenv()
 
 # ==========================================
 # 2. CONFIGURATION & LOGGING SETUP
@@ -25,32 +30,49 @@ logger = logging.getLogger("jambawear_api")
 
 app = Flask(__name__)
 
+# Pull from .env (fallback to allow all if not set)
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}})
 
+# Pull from .env (fallback to jamba4334@gmail.com if missing)
 ALLOWED_ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "jamba4334@gmail.com")
 
 # ==========================================
 # 3. INITIALIZE SERVICES
 # ==========================================
-FIREBASE_KEY_PATH = os.getenv("FIREBASE_KEY_PATH", "firebase-key.json")
+# Pull the raw JSON string from .env
+FIREBASE_CONFIG_STR = os.getenv("FIREBASE_CONFIG")
 
 try:
     if not firebase_admin._apps:
-        cred = credentials.Certificate(FIREBASE_KEY_PATH)
-        firebase_admin.initialize_app(cred)
-    db = firestore.client()
-    logger.info("✅ Firebase initialized successfully.")
+        if FIREBASE_CONFIG_STR:
+            # Parse the JSON string into a Python dictionary
+            cred_dict = json.loads(FIREBASE_CONFIG_STR)
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cred)
+        else:
+            logger.error("❌ FIREBASE_CONFIG is missing from .env variables.")
+            
+    if firebase_admin._apps:
+        db = firestore.client()
+        logger.info("✅ Firebase initialized successfully.")
+    else:
+        db = None
 except Exception as e:
     logger.error(f"❌ Firebase initialization failed: {e}")
     db = None
 
-RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "rzp_test_SvVCY9dpYnL1Kq")
-RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "YOUR_SECRET_KEY_HERE")
+# Pull from .env
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
 
 try:
-    razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
-    logger.info("✅ Razorpay client initialized.")
+    if RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET:
+        razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+        logger.info("✅ Razorpay client initialized.")
+    else:
+        logger.warning("⚠️ Razorpay keys missing. Payment gateway disabled.")
+        razorpay_client = None
 except Exception as e:
     logger.error(f"❌ Razorpay initialization failed: {e}")
     razorpay_client = None
@@ -90,12 +112,10 @@ def seller_required(f):
             if not email:
                 return jsonify({"error": "Invalid token payload"}), 401
             
-            # Verify the seller exists in the authorized_sellers collection
             seller_doc = db.collection("authorized_sellers").document(email).get()
             if not seller_doc.exists:
                 return jsonify({"error": "Forbidden: Seller account not found"}), 403
                 
-            # Attach the verified email to the request context
             request.seller_email = email
         except Exception as e:
             return jsonify({"error": "Unauthorized: Invalid token"}), 401
@@ -108,7 +128,7 @@ def seller_required(f):
 # ==========================================
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"server": "running"}), 200
+    return jsonify({"server": "running", "status": "ok"}), 200
 
 @app.route("/create-order", methods=["POST"])
 def create_order():
@@ -218,7 +238,7 @@ def verify_payment():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 6. ADMIN ROUTES (Protected)
+# 6. ADMIN ROUTES (Protected & Bulletproofed)
 # ==========================================
 @app.route("/admin/products", methods=["GET", "POST"])
 @admin_required
@@ -231,26 +251,31 @@ def admin_products():
             docs = db.collection("products").order_by("created_at", direction=firestore.Query.DESCENDING).limit(limit).get()
             for doc in docs: products.append({**doc.to_dict(), "docId": doc.id})
             return jsonify(products), 200
-        except Exception: return jsonify({"error": "Internal server error"}), 500
+        except Exception as e: 
+            return jsonify({"error": str(e)}), 500
     if request.method == "POST":
         try:
             data = request.get_json()
             data["created_at"] = datetime.utcnow().isoformat()
             _, doc_ref = db.collection("products").add(data)
             return jsonify({"status": "success", "id": doc_ref.id}), 201
-        except Exception: return jsonify({"error": "Failed to create product"}), 500
+        except Exception as e: 
+            return jsonify({"error": str(e)}), 500
 
 @app.route("/admin/products/<doc_id>", methods=["PUT", "DELETE"])
 @admin_required
 def admin_product_detail(doc_id):
     if db is None: return jsonify({"error": "Database unavailable"}), 503
-    doc_ref = db.collection("products").document(doc_id)
-    if request.method == "PUT":
-        doc_ref.update(request.get_json())
-        return jsonify({"status": "success"}), 200
-    if request.method == "DELETE":
-        doc_ref.delete()
-        return jsonify({"status": "success"}), 200
+    try:
+        doc_ref = db.collection("products").document(doc_id)
+        if request.method == "PUT":
+            doc_ref.update(request.get_json())
+            return jsonify({"status": "success"}), 200
+        if request.method == "DELETE":
+            doc_ref.delete()
+            return jsonify({"status": "success"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/admin/orders", methods=["GET"])
 @admin_required
@@ -262,89 +287,105 @@ def admin_orders():
         docs = db.collection("orders").order_by("created_at", direction=firestore.Query.DESCENDING).limit(limit).get()
         for doc in docs: orders.append({**doc.to_dict(), "id": doc.id})
         return jsonify(orders), 200
-    except Exception: return jsonify({"error": "Internal server error"}), 500
+    except Exception as e: 
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/admin/orders/<order_id>", methods=["PUT"])
 @admin_required
 def update_order(order_id):
     if db is None: return jsonify({"error": "Database unavailable"}), 503
-    db.collection("orders").document(order_id).update(request.get_json())
-    return jsonify({"status": "success"}), 200
+    try:
+        db.collection("orders").document(order_id).update(request.get_json())
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/admin/orders/<order_id>/force-clear", methods=["POST"])
 @admin_required
 def force_clear_order(order_id):
     if db is None: return jsonify({"error": "Database unavailable"}), 503
-    db.collection("orders").document(order_id).update({"status": "settled_override"})
-    return jsonify({"status": "success", "message": "Escrow released manually."}), 200
+    try:
+        db.collection("orders").document(order_id).update({"status": "settled_override"})
+        return jsonify({"status": "success", "message": "Escrow released manually."}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/admin/customers", methods=["GET"])
 @admin_required
 def admin_customers():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
-    limit = int(request.args.get("limit", 50))
-    customers = [{**doc.to_dict(), "id": doc.id} for doc in db.collection("users").limit(limit).get()]
-    return jsonify(customers), 200
+    try:
+        limit = int(request.args.get("limit", 50))
+        customers = [{**doc.to_dict(), "id": doc.id} for doc in db.collection("users").limit(limit).get()]
+        return jsonify(customers), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/admin/settings/<doc_id>", methods=["GET", "PUT"])
 @admin_required
 def admin_settings(doc_id):
     if db is None: return jsonify({"error": "Database unavailable"}), 503
-    if request.method == "GET":
-        doc = db.collection("settings").document(doc_id).get()
-        if doc.exists: return jsonify(doc.to_dict()), 200
-        return jsonify({"tribes": []} if doc_id == "tribe_categories" else {}), 200
-    if request.method == "PUT":
-        data = request.get_json()
-        if doc_id == "tribe_categories": data["last_updated"] = datetime.utcnow().isoformat()
-        db.collection("settings").document(doc_id).set(data, merge=True)
-        return jsonify({"status": "Settings updated"}), 200
+    try:
+        if request.method == "GET":
+            doc = db.collection("settings").document(doc_id).get()
+            if doc.exists: return jsonify(doc.to_dict()), 200
+            return jsonify({"tribes": []} if doc_id == "tribe_categories" else {}), 200
+        if request.method == "PUT":
+            data = request.get_json()
+            if doc_id == "tribe_categories": data["last_updated"] = datetime.utcnow().isoformat()
+            db.collection("settings").document(doc_id).set(data, merge=True)
+            return jsonify({"status": "Settings updated"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/admin/sellers", methods=["GET", "POST"])
 @admin_required
 def admin_sellers():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
-    
-    if request.method == "GET":
-        sellers = []
-        for doc in db.collection("authorized_sellers").get():
-            seller_data = {**doc.to_dict(), "id": doc.id}
+    try:
+        if request.method == "GET":
+            sellers = []
+            for doc in db.collection("authorized_sellers").get():
+                seller_data = {**doc.to_dict(), "id": doc.id}
+                prof_doc = db.collection("seller_profiles").document(doc.id).get()
+                seller_data["profile"] = prof_doc.to_dict() if prof_doc.exists else {}
+                sellers.append(seller_data)
+            return jsonify(sellers), 200
             
-            # Fetch profile directly on the backend to prevent frontend API spam
-            prof_doc = db.collection("seller_profiles").document(doc.id).get()
-            seller_data["profile"] = prof_doc.to_dict() if prof_doc.exists else {}
-            
-            sellers.append(seller_data)
-        return jsonify(sellers), 200
-        
-    if request.method == "POST":
-        email = request.get_json().get("email")
-        db.collection("authorized_sellers").document(email).set({
-            "email": email, "addedAt": datetime.utcnow().isoformat(), "addedBy": ALLOWED_ADMIN_EMAIL
-        })
-        return jsonify({"status": "Seller authorized"}), 201
+        if request.method == "POST":
+            email = request.get_json().get("email")
+            db.collection("authorized_sellers").document(email).set({
+                "email": email, "addedAt": datetime.utcnow().isoformat(), "addedBy": ALLOWED_ADMIN_EMAIL
+            })
+            return jsonify({"status": "Seller authorized"}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/admin/sellers/<email>", methods=["DELETE"])
 @admin_required
 def remove_seller(email):
-    db.collection("authorized_sellers").document(email).delete()
-    return jsonify({"status": "Seller removed"}), 200
+    try:
+        db.collection("authorized_sellers").document(email).delete()
+        return jsonify({"status": "Seller removed"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-# 🔥 NEW ROUTE: Fetch and update the seller's profile details
 @app.route("/admin/seller_profiles/<email>", methods=["GET", "PUT"])
 @admin_required
 def admin_seller_profile(email):
     if db is None: return jsonify({"error": "Database unavailable"}), 503
-    
-    if request.method == "GET":
-        doc = db.collection("seller_profiles").document(email).get()
-        return jsonify(doc.to_dict() if doc.exists else {}), 200
-        
-    if request.method == "PUT":
-        data = request.get_json()
-        data["updated_at"] = datetime.utcnow().isoformat()
-        db.collection("seller_profiles").document(email).set(data, merge=True)
-        return jsonify({"status": "Profile updated"}), 200
+    try:
+        if request.method == "GET":
+            doc = db.collection("seller_profiles").document(email).get()
+            return jsonify(doc.to_dict() if doc.exists else {}), 200
+            
+        if request.method == "PUT":
+            data = request.get_json()
+            data["updated_at"] = datetime.utcnow().isoformat()
+            db.collection("seller_profiles").document(email).set(data, merge=True)
+            return jsonify({"status": "Profile updated"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ==========================================
 # 7. ADMIN FINANCE, LEDGERS & GOD-MODE
@@ -353,110 +394,128 @@ def admin_seller_profile(email):
 @admin_required
 def admin_payouts():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
-    status_filter = request.args.get("status")
-    email_filter = request.args.get("email")
-    
-    query = db.collection("payout_requests")
-    if status_filter: 
-        query = query.where("status", "==", status_filter)
-    if email_filter:
-        query = query.where("email", "==", email_filter)
+    try:
+        status_filter = request.args.get("status")
+        email_filter = request.args.get("email")
         
-    payouts = [{**doc.to_dict(), "id": doc.id} for doc in query.get()]
-    return jsonify(payouts), 200
+        query = db.collection("payout_requests")
+        if status_filter: 
+            query = query.where("status", "==", status_filter)
+        if email_filter:
+            query = query.where("email", "==", email_filter)
+            
+        payouts = [{**doc.to_dict(), "id": doc.id} for doc in query.get()]
+        return jsonify(payouts), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/admin/finance/customer-payments", methods=["GET"])
 @admin_required
 def admin_customer_payments():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
-    limit = int(request.args.get("limit", 100))
-    docs = db.collection("orders").order_by("created_at", direction=firestore.Query.DESCENDING).limit(limit).get()
-    payments = []
-    for doc in docs:
-        order = doc.to_dict()
-        raw_method = order.get("payment_method", "Online")
-        payments.append({
-            "id": doc.id,
-            "order_id": order.get("jamba_order_id", "N/A"),
-            "customer": order.get("email", "Guest"),
-            "amount": order.get("total", 0),
-            "method": "COD" if raw_method.upper() == "COD" else "Online",
-            "status": order.get("status", "pending"),
-            "date": datetime.fromisoformat(order.get("created_at")).strftime("%d %b %Y") if order.get("created_at") else "Unknown"
-        })
-    return jsonify(payments), 200
+    try:
+        limit = int(request.args.get("limit", 100))
+        docs = db.collection("orders").order_by("created_at", direction=firestore.Query.DESCENDING).limit(limit).get()
+        payments = []
+        for doc in docs:
+            order = doc.to_dict()
+            raw_method = order.get("payment_method", "Online")
+            payments.append({
+                "id": doc.id,
+                "order_id": order.get("jamba_order_id", "N/A"),
+                "customer": order.get("email", "Guest"),
+                "amount": order.get("total", 0),
+                "method": "COD" if raw_method.upper() == "COD" else "Online",
+                "status": order.get("status", "pending"),
+                "date": datetime.fromisoformat(order.get("created_at")).strftime("%d %b %Y") if order.get("created_at") else "Unknown"
+            })
+        return jsonify(payments), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/admin/finance/kpis", methods=["GET"])
 @admin_required
 def admin_finance_kpis():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
-    payouts_query = db.collection("payout_requests").where("status", "==", "pending").get()
-    pending_payouts = sum([float(doc.to_dict().get("amount", doc.to_dict().get("netPayable", 0))) for doc in payouts_query])
+    try:
+        payouts_query = db.collection("payout_requests").where("status", "==", "pending").get()
+        pending_payouts = sum([float(doc.to_dict().get("amount", doc.to_dict().get("netPayable", 0))) for doc in payouts_query])
 
-    orders_query = db.collection("orders").where("status", "==", "paid").get()
-    in_escrow = sum([float(doc.to_dict().get("total", 0)) for doc in orders_query])
+        orders_query = db.collection("orders").where("status", "==", "paid").get()
+        in_escrow = sum([float(doc.to_dict().get("total", 0)) for doc in orders_query])
 
-    settled_query = db.collection("payout_requests").where("status", "==", "paid").get()
-    jamba_revenue = sum([float(doc.to_dict().get("jambaFee", 0)) for doc in settled_query])
-    
-    return jsonify({
-        "jambaRevenue": round(jamba_revenue, 2),
-        "pendingPayouts": round(pending_payouts, 2),
-        "inEscrow": round(in_escrow, 2),
-        "totalGST": round(jamba_revenue * 0.18, 2)
-    }), 200
+        settled_query = db.collection("payout_requests").where("status", "==", "paid").get()
+        jamba_revenue = sum([float(doc.to_dict().get("jambaFee", 0)) for doc in settled_query])
+        
+        return jsonify({
+            "jambaRevenue": round(jamba_revenue, 2),
+            "pendingPayouts": round(pending_payouts, 2),
+            "inEscrow": round(in_escrow, 2),
+            "totalGST": round(jamba_revenue * 0.18, 2)
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/admin/transactions", methods=["GET"])
 @admin_required
 def admin_transactions():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
-    limit = int(request.args.get("limit", 100))
-    docs = db.collection("transactions").order_by("created_at", direction=firestore.Query.DESCENDING).limit(limit).get()
-    return jsonify([{**doc.to_dict(), "id": doc.id} for doc in docs]), 200
+    try:
+        limit = int(request.args.get("limit", 100))
+        docs = db.collection("transactions").order_by("created_at", direction=firestore.Query.DESCENDING).limit(limit).get()
+        return jsonify([{**doc.to_dict(), "id": doc.id} for doc in docs]), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/admin/finance/adjust", methods=["POST"])
 @admin_required
 def inject_financial_adjustment():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
-    data = request.get_json()
-    brand = data.get("brand", "Global Correction")
-    amount = float(data.get("amount", 0))
-    db.collection("transactions").add({
-        "txId": f"ADJ-{int(datetime.utcnow().timestamp())}",
-        "date": datetime.utcnow().strftime("%d %b %Y"),
-        "created_at": datetime.utcnow().isoformat(),
-        "type": "Bonus" if amount >= 0 else "Penalty",
-        "brand": brand,
-        "amount": f"+ ₹{amount}" if amount >= 0 else f"- ₹{abs(amount)}",
-        "status": f"Applied: {data.get('reason', 'Force Adj')}"
-    })
-    return jsonify({"status": "success"}), 201
+    try:
+        data = request.get_json()
+        brand = data.get("brand", "Global Correction")
+        amount = float(data.get("amount", 0))
+        db.collection("transactions").add({
+            "txId": f"ADJ-{int(datetime.utcnow().timestamp())}",
+            "date": datetime.utcnow().strftime("%d %b %Y"),
+            "created_at": datetime.utcnow().isoformat(),
+            "type": "Bonus" if amount >= 0 else "Penalty",
+            "brand": brand,
+            "amount": f"+ ₹{amount}" if amount >= 0 else f"- ₹{abs(amount)}",
+            "status": f"Applied: {data.get('reason', 'Force Adj')}"
+        })
+        return jsonify({"status": "success"}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/admin/payouts/<payout_id>", methods=["PUT"])
 @admin_required
 def update_payout(payout_id):
     if db is None: return jsonify({"error": "Database unavailable"}), 503
-    data = request.get_json()
-    payout_ref = db.collection("payout_requests").document(payout_id)
-    payout_doc = payout_ref.get()
-    
-    if not payout_doc.exists: return jsonify({"error": "Payout not found"}), 404
-    payout_ref.update(data)
-    
-    if data.get("status") == "paid":
-        pinfo = payout_doc.to_dict()
-        amount = pinfo.get("amount", pinfo.get("netPayable", 0))
-        db.collection("transactions").add({
-            "txId": f"TXN-{int(datetime.utcnow().timestamp())}",
-            "date": datetime.utcnow().strftime("%d %b %Y"),
-            "created_at": datetime.utcnow().isoformat(),
-            "type": "Payout",
-            "brand": pinfo.get("brand", "Unknown Seller"),
-            "amount": f"- ₹{amount}",
-            "status": f"Paid (UTR: {data.get('utr', 'N/A')})",
-            "payout_id": payout_id
-        })
-    return jsonify({"status": "Payout updated and ledger recorded"}), 200
+    try:
+        data = request.get_json()
+        payout_ref = db.collection("payout_requests").document(payout_id)
+        payout_doc = payout_ref.get()
+        
+        if not payout_doc.exists: return jsonify({"error": "Payout not found"}), 404
+        payout_ref.update(data)
+        
+        if data.get("status") == "paid":
+            pinfo = payout_doc.to_dict()
+            amount = pinfo.get("amount", pinfo.get("netPayable", 0))
+            db.collection("transactions").add({
+                "txId": f"TXN-{int(datetime.utcnow().timestamp())}",
+                "date": datetime.utcnow().strftime("%d %b %Y"),
+                "created_at": datetime.utcnow().isoformat(),
+                "type": "Payout",
+                "brand": pinfo.get("brand", "Unknown Seller"),
+                "amount": f"- ₹{amount}",
+                "status": f"Paid (UTR: {data.get('utr', 'N/A')})",
+                "payout_id": payout_id
+            })
+        return jsonify({"status": "Payout updated and ledger recorded"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ==========================================
 # 8. SELLER FINANCE & PAYOUT ROUTES (SECURE PIPELINE)
@@ -574,5 +633,6 @@ def request_payout():
 # 9. RUN THE SERVER
 # ==========================================
 if __name__ == "__main__":
+    # Pull from .env or fallback to 5000
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
