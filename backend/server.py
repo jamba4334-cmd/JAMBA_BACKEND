@@ -90,8 +90,25 @@ def admin_required(f):
         token = auth_header.split(" ")[1]
         try:
             decoded_token = firebase_auth.verify_id_token(token)
-            if decoded_token.get("email") != ALLOWED_ADMIN_EMAIL:
-                return jsonify({"error": "Forbidden: Insufficient permissions"}), 403
+            email = decoded_token.get("email")
+            
+            # 1. Master Admin Check (Bypasses database lookup)
+            if email == ALLOWED_ADMIN_EMAIL:
+                return f(*args, **kwargs)
+
+            # 2. Sub-Admin Check (Verifies against Firestore)
+            if db is not None:
+                admin_query = db.collection("admin_users").where("email", "==", email).limit(1).get()
+                
+                if len(admin_query) > 0:
+                    admin_data = admin_query[0].to_dict()
+                    # Ensure they exist and are actively authorized
+                    if admin_data.get("isAuthorized") == True:
+                        return f(*args, **kwargs)
+
+            # If neither the Master Admin nor an authorized Sub-Admin matched, deny access
+            return jsonify({"error": "Forbidden: Insufficient permissions"}), 403
+
         except Exception as e:
             return jsonify({"error": "Unauthorized: Invalid or expired token"}), 401
             
