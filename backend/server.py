@@ -4,6 +4,7 @@
 import os
 import json
 import logging
+import requests # Added for API calls to Delhivery
 from datetime import datetime
 from functools import wraps
 
@@ -15,7 +16,7 @@ import razorpay
 import firebase_admin
 from firebase_admin import credentials, firestore, auth as firebase_auth
 
-# 🔥 NEW: Load environment variables from the .env file
+# Load environment variables from the .env file
 load_dotenv()
 
 # ==========================================
@@ -402,6 +403,104 @@ def admin_seller_profile(email):
             db.collection("seller_profiles").document(email).set(data, merge=True)
             return jsonify({"status": "Profile updated"}), 200
     except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ==========================================
+# DELHIVERY SHIPMENT ROUTE
+# ==========================================
+@app.route("/admin/orders/<order_id>/ship-delhivery", methods=["POST"])
+@admin_required
+def ship_via_delhivery(order_id):
+    if db is None: 
+        return jsonify({"error": "Database unavailable"}), 503
+    try:
+        # 1. Fetch order document from Firestore
+        order_ref = db.collection("orders").document(order_id)
+        order_doc = order_ref.get()
+        if not order_doc.exists:
+            return jsonify({"error": f"Order {order_id} not found."}), 404
+
+        order = order_doc.to_dict()
+        delhivery_api_key = os.getenv("DELHIVERY_API_KEY")
+
+        if not delhivery_api_key:
+            return jsonify({"error": "Delhivery API key missing in server config."}), 500
+
+        shipping_addr = order.get("shippingAddress", {})
+
+        # 2. Format the Payload for Delhivery One CMU API
+        shipment_payload = {
+            "format": "json",
+            "data": json.dumps({
+                "shipments": [
+                    {
+                        "name": shipping_addr.get("fullName", shipping_addr.get("name", "Customer")),
+                        "add": shipping_addr.get("address", shipping_addr.get("street", "")),
+                        "pin": str(shipping_addr.get("pincode", shipping_addr.get("zip", ""))),
+                        "city": shipping_addr.get("city", ""),
+                        "state": shipping_addr.get("state", ""),
+                        "country": "India",
+                        "phone": str(shipping_addr.get("phone", shipping_addr.get("mobile", ""))),
+                        "order": order.get("jamba_order_id", order_id),
+                        "payment_mode": "COD" if order.get("payment_method") == "COD" else "Pre-paid",
+                        "return_pin": "781001",  # Replace with your actual warehouse pincode
+                        "return_city": "Guwahati",
+                        "return_phone": "9876543210",  # Replace with your warehouse phone
+                        "return_add": "Guwahati Warehouse Address",
+                        "return_state": "Assam",
+                        "return_country": "India",
+                        "products_desc": "Jamba Wear Apparel",
+                        "cod_amount": float(order.get("total", 0)) if order.get("payment_method") == "COD" else 0,
+                        "total_amount": float(order.get("total", 0)),
+                        "weight": 500  # Default weight in grams
+                    }
+                ],
+                "pickup_location": {
+                    # MUST match the exact registered Pickup Location name in your Delhivery Dashboard
+                    "name": "JAMBA_MAIN_WAREHOUSE", 
+                    "add": "Guwahati Warehouse Address",
+                    "city": "Guwahati",
+                    "pin": "781001",
+                    "country": "India",
+                    "phone": "9876543210"
+                }
+            })
+        }
+
+        headers = {
+            "Authorization": f"Token {delhivery_api_key}",
+            "Content-Type": "application/json"
+        }
+
+        # 3. Request shipment creation from Delhivery
+        url = "https://track.delhivery.com/api/cmu/create.json"
+        response = requests.post(url, headers=headers, json=shipment_payload)
+        result = response.json()
+
+        # 4. Handle Delhivery response and store tracking number in Firestore
+        if result.get("success"):
+            packages = result.get("packages", [])
+            awb = packages[0].get("waybill") if packages else None
+
+            order_ref.update({
+                "tracking_number": awb,
+                "shipping_status": "Dispatched",
+                "dispatched_at": datetime.utcnow().isoformat()
+            })
+
+            return jsonify({
+                "status": "success",
+                "tracking_number": awb,
+                "message": "Shipment created successfully with Delhivery!"
+            }), 200
+        else:
+            return jsonify({
+                "error": "Delhivery rejected the shipment request.",
+                "details": result
+            }), 400
+
+    except Exception as e:
+        logger.error(f"Delhivery Dispatch Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
