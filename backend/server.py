@@ -248,9 +248,18 @@ def create_order():
                 else:
                     total_discount = min(discount_value, seller_eligible_subtotal)
 
+        # --- GST CALCULATION (Applied to the post-discount taxable value) ---
+        taxable_value = secure_subtotal - total_discount
+        
+        # Apparel GST Rule: 5% if below 2500, 18% if above
+        if taxable_value <= 2500:
+            total_gst = taxable_value * 0.05
+        else:
+            total_gst = taxable_value * 0.18
+
         shipping_fee = 149 if secure_subtotal < 1999 else 0
-        final_total = max((secure_subtotal - total_discount) + shipping_fee, 0)
-        unique_jamba_id = "JB" + datetime.now().strftime("%y%m%d%H%M%S")
+        final_total = max(taxable_value + shipping_fee, 0)
+        unique_jamba_id = "JB" + datetime.now(timezone.utc).strftime("%y%m%d%H%M%S")
 
         order_data = {
             "jamba_order_id": unique_jamba_id,
@@ -259,6 +268,10 @@ def create_order():
             "subtotal": secure_subtotal,
             "discount_applied": total_discount,
             "promo_used": promo_code_str if total_discount > 0 else None,
+            "promo_creator_role": promo_data.get("creator_role") if promo_data else None,
+            "promo_seller_email": promo_data.get("seller_email") if promo_data else None,
+            "taxable_value": taxable_value,
+            "total_gst": total_gst,
             "shipping_fee": shipping_fee,
             "total": final_total,
             "status": "pending",
@@ -633,45 +646,62 @@ def get_isolated_seller_data():
             if order_status not in ["paid", "processing", "delivered", "settled_override"]: 
                 continue
                 
-            for item in order.get("items", []):
-                if item.get("sellerEmail") == current_seller_email:
-                    item_price = float(item.get("price", 0))
-                    item_qty = int(item.get("quantity", 1))
-                    gross_item_revenue = item_price * item_qty
+            # 1. Determine if this seller pays for the discount
+            order_discount = float(order.get("discount_applied", 0))
+            promo_role = order.get("promo_creator_role")
+            promo_email = order.get("promo_seller_email")
+            seller_bears_discount = (promo_role == "seller" and promo_email == current_seller_email)
+            
+            # 2. Get total gross for this seller to proportionately divide the discount
+            seller_items = [i for i in order.get("items", []) if i.get("sellerEmail") == current_seller_email]
+            seller_gross_total = sum(float(i.get("price", 0)) * int(i.get("quantity", 1)) for i in seller_items)
+                
+            for item in seller_items:
+                item_price = float(item.get("price", 0))
+                item_qty = int(item.get("quantity", 1))
+                gross_item_revenue = item_price * item_qty
+                
+                # 3. Deduct proportional discount if the seller created the code
+                item_discount = 0
+                if seller_bears_discount and seller_gross_total > 0:
+                    item_discount = order_discount * (gross_item_revenue / seller_gross_total)
                     
-                    jamba_fee = gross_item_revenue * (commission_percent / 100.0)
-                    commission_gst = jamba_fee * 0.18
+                discounted_item_revenue = gross_item_revenue - item_discount
+                
+                # 4. JAMBA commission is now taken from the discounted price!
+                jamba_fee = discounted_item_revenue * (commission_percent / 100.0)
+                commission_gst = jamba_fee * 0.18
+                
+                if discounted_item_revenue <= gst_threshold:
+                    product_gst_percent = gst_lower_rate
+                else:
+                    product_gst_percent = gst_upper_rate
                     
-                    if item_price <= gst_threshold:
-                        product_gst_percent = gst_lower_rate
-                    else:
-                        product_gst_percent = gst_upper_rate
-                        
-                    net_product_value = gross_item_revenue / (1 + (product_gst_percent / 100.0))
-                    tcs_amount = net_product_value * (tcs_percent / 100.0)
-                    
-                    net_seller_earnings = gross_item_revenue - jamba_fee - commission_gst - tcs_amount
-                    
-                    isolated_sales_ledger.append({
-                        "order_id": order.get("jamba_order_id", "N/A"),
-                        "date": order.get("created_at"),
-                        "product_name": item.get("name", item.get("title", "Product")),
-                        "qty": item_qty,
-                        "gross": round(gross_item_revenue, 2),
-                        "fee": round(jamba_fee, 2),
-                        "commission_gst": round(commission_gst, 2),
-                        "tcs": round(tcs_amount, 2),
-                        "net": round(net_seller_earnings, 2),
-                        "status": order_status
-                    })
-                    
-                    if order_status in ["delivered", "settled_override"]:
-                        secure_wallet["available"] += net_seller_earnings
-                    # FIXED: Added "processing" to pending funds logic
-                    elif order_status in ["paid", "processing"]:
-                        secure_wallet["pending"] += net_seller_earnings
-                    
-                    secure_wallet["lifetime"] += net_seller_earnings
+                net_product_value = discounted_item_revenue / (1 + (product_gst_percent / 100.0))
+                tcs_amount = net_product_value * (tcs_percent / 100.0)
+                
+                net_seller_earnings = discounted_item_revenue - jamba_fee - commission_gst - tcs_amount
+                
+                isolated_sales_ledger.append({
+                    "order_id": order.get("jamba_order_id", "N/A"),
+                    "date": order.get("created_at"),
+                    "product_name": item.get("name", item.get("title", "Product")),
+                    "qty": item_qty,
+                    "gross": round(discounted_item_revenue, 2),
+                    "fee": round(jamba_fee, 2),
+                    "commission_gst": round(commission_gst, 2),
+                    "tcs": round(tcs_amount, 2),
+                    "net": round(net_seller_earnings, 2),
+                    "status": order_status
+                })
+                
+                if order_status in ["delivered", "settled_override"]:
+                    secure_wallet["available"] += net_seller_earnings
+                # FIXED: Added "processing" to pending funds logic
+                elif order_status in ["paid", "processing"]:
+                    secure_wallet["pending"] += net_seller_earnings
+                
+                secure_wallet["lifetime"] += net_seller_earnings
 
         payouts_query = db.collection("payout_requests").where("email", "==", current_seller_email).get()
         for doc in payouts_query:
