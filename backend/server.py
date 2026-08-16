@@ -15,7 +15,11 @@ import razorpay
 import firebase_admin
 from firebase_admin import credentials, firestore, auth as firebase_auth
 
-# 🔥 NEW: Load environment variables from the .env file
+from fpdf import FPDF
+import io
+from flask import send_file
+
+# Load environment variables from the .env file
 load_dotenv()
 
 # ==========================================
@@ -30,11 +34,9 @@ logger = logging.getLogger("jambawear_api")
 
 app = Flask(__name__)
 
-# Pull from .env (fallback to allow all if not set)
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}})
 
-# Pull from .env (fallback to jamba4334@gmail.com if missing)
 ALLOWED_ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "jamba4334@gmail.com")
 
 # ==========================================
@@ -148,10 +150,34 @@ def create_order():
         customer_email = data.get("customer", "guest@jambawear.com")
         shipping_address = data.get("shippingAddress", {})
         payment_method = data.get("payment_method", "Razorpay")
+        promo_code_str = data.get("promo_code", "").strip().upper()
 
         secure_subtotal = 0
         enriched_cart = []
         seller_emails_set = set()
+
+        # 1. VERIFY PROMO CODE
+        promo_data = None
+        if promo_code_str:
+            promo_query = db.collection("promocodes").where("code", "==", promo_code_str).where("status", "==", "active").limit(1).get()
+            if promo_query:
+                temp_promo = promo_query[0].to_dict()
+                now = datetime.utcnow().isoformat()
+                
+                is_valid_time = True
+                if temp_promo.get("valid_from") and now < temp_promo.get("valid_from"): is_valid_time = False
+                if temp_promo.get("valid_until") and now > temp_promo.get("valid_until"): is_valid_time = False
+                
+                is_valid_usage = True
+                if temp_promo.get("usage_limit") == "single" and customer_email in temp_promo.get("used_by", []): is_valid_usage = False
+                
+                if is_valid_time and is_valid_usage:
+                    promo_data = temp_promo
+                    promo_doc_id = promo_query[0].id
+
+        # 2. PROCESS CART & ISOLATE DISCOUNTS PER BRAND
+        total_discount = 0
+        seller_eligible_subtotal = 0
 
         for item in cart:
             item_id = str(item.get("id"))
@@ -166,12 +192,18 @@ def create_order():
                 product = doc_ref.to_dict()
 
             real_price = float(product.get("selling_price", 0))
-            secure_subtotal += real_price * quantity
+            item_total = real_price * quantity
+            secure_subtotal += item_total
             
             seller_email = product.get("sellerEmail", "")
             if seller_email: seller_emails_set.add(seller_email)
             
             is_returnable = product.get("isReturnable", True)
+
+            # Check if this item belongs to the seller who made the promo code
+            if promo_data and promo_data.get("creator_role") == "seller":
+                if promo_data.get("seller_email") == seller_email:
+                    seller_eligible_subtotal += item_total
 
             item.update({
                 "price": real_price,
@@ -182,8 +214,24 @@ def create_order():
             })
             enriched_cart.append(item)
 
+        # 3. CALCULATE FINAL MATH
+        if promo_data:
+            discount_value = float(promo_data.get("value", 0))
+            
+            if promo_data.get("creator_role") == "admin":
+                if promo_data.get("type") == "percentage":
+                    total_discount = secure_subtotal * (discount_value / 100)
+                else:
+                    total_discount = min(discount_value, secure_subtotal)
+            
+            elif promo_data.get("creator_role") == "seller":
+                if promo_data.get("type") == "percentage":
+                    total_discount = seller_eligible_subtotal * (discount_value / 100)
+                else:
+                    total_discount = min(discount_value, seller_eligible_subtotal)
+
         shipping_fee = 149 if secure_subtotal < 1999 else 0
-        final_total = secure_subtotal + shipping_fee
+        final_total = max((secure_subtotal - total_discount) + shipping_fee, 0)
         unique_jamba_id = "JB" + datetime.now().strftime("%y%m%d%H%M%S")
 
         order_data = {
@@ -191,6 +239,8 @@ def create_order():
             "email": customer_email,
             "items": enriched_cart,
             "subtotal": secure_subtotal,
+            "discount_applied": total_discount,
+            "promo_used": promo_code_str if total_discount > 0 else None,
             "shipping_fee": shipping_fee,
             "total": final_total,
             "status": "pending",
@@ -199,6 +249,11 @@ def create_order():
             "created_at": datetime.utcnow().isoformat(),
             "sellerEmails": list(seller_emails_set)
         }
+
+        if total_discount > 0 and promo_data and promo_data.get("usage_limit") == "single":
+            db.collection("promocodes").document(promo_doc_id).update({
+                "used_by": firestore.ArrayUnion([customer_email])
+            })
 
         if payment_method == "COD":
             order_data["order_id"] = f"cod_{int(datetime.now().timestamp())}"
@@ -247,7 +302,7 @@ def verify_payment():
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 6. ADMIN ROUTES (Protected & Bulletproofed)
+# 6. ADMIN ROUTES
 # ==========================================
 @app.route("/admin/products", methods=["GET", "POST"])
 @admin_required
@@ -397,7 +452,7 @@ def admin_seller_profile(email):
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 7. ADMIN FINANCE, LEDGERS & GOD-MODE
+# 7. ADMIN FINANCE & LEDGERS
 # ==========================================
 @app.route("/admin/payouts", methods=["GET"])
 @admin_required
@@ -527,7 +582,7 @@ def update_payout(payout_id):
         return jsonify({"error": str(e)}), 500
 
 # ==========================================
-# 8. SELLER FINANCE & PAYOUT ROUTES (SECURE PIPELINE)
+# 8. SELLER FINANCE & PAYOUT ROUTES
 # ==========================================
 @app.route("/api/v1/seller/dashboard", methods=["GET"])
 @seller_required
@@ -660,7 +715,6 @@ def request_payout():
 @admin_required
 def admin_promocodes():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
-    
     try:
         if request.method == "GET":
             docs = db.collection("promocodes").order_by("created_at", direction=firestore.Query.DESCENDING).get()
@@ -689,7 +743,6 @@ def admin_promocodes():
             }
             _, doc_ref = db.collection("promocodes").add(promo_data)
             return jsonify({"status": "success", "id": doc_ref.id}), 201
-            
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -699,16 +752,13 @@ def manage_promocode(doc_id):
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     try:
         doc_ref = db.collection("promocodes").document(doc_id)
-        
         if request.method == "PUT":
             update_data = request.get_json()
             doc_ref.update({"status": update_data.get("status", "pending")})
             return jsonify({"status": "success"}), 200
-            
         if request.method == "DELETE":
             doc_ref.delete()
             return jsonify({"status": "success"}), 200
-            
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -746,7 +796,6 @@ def seller_promocodes():
             }
             _, doc_ref = db.collection("promocodes").add(promo_data)
             return jsonify({"status": "success", "id": doc_ref.id}), 201
-
     except Exception as e:
         logger.error(f"Seller Promo Error: {e}")
         return jsonify({"error": "Failed to process promo code"}), 500
@@ -771,14 +820,12 @@ def validate_promocode():
         if promo.get("status") != "active":
             return jsonify({"error": "Promo code is not active or awaiting approval"}), 400
 
-        # Time validation
         now = datetime.utcnow().isoformat()
         if promo.get("valid_from") and now < promo.get("valid_from"):
             return jsonify({"error": "Promo code is not yet valid"}), 400
         if promo.get("valid_until") and now > promo.get("valid_until"):
             return jsonify({"error": "Promo code has expired"}), 400
 
-        # Usage limit validation
         if promo.get("usage_limit") == "single":
             if customer_email and customer_email in promo.get("used_by", []):
                 return jsonify({"error": "You have already used this promo code"}), 400
@@ -790,7 +837,6 @@ def validate_promocode():
             "creator_role": promo.get("creator_role"),
             "seller_email": promo.get("seller_email")
         }), 200
-
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
