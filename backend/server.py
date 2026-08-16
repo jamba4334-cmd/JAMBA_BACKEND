@@ -40,13 +40,11 @@ ALLOWED_ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "jamba4334@gmail.com")
 # ==========================================
 # 3. INITIALIZE SERVICES
 # ==========================================
-# Pull the raw JSON string from .env
 FIREBASE_CONFIG_STR = os.getenv("FIREBASE_CONFIG")
 
 try:
     if not firebase_admin._apps:
         if FIREBASE_CONFIG_STR:
-            # Parse the JSON string into a Python dictionary
             cred_dict = json.loads(FIREBASE_CONFIG_STR)
             cred = credentials.Certificate(cred_dict)
             firebase_admin.initialize_app(cred)
@@ -62,7 +60,6 @@ except Exception as e:
     logger.error(f"❌ Firebase initialization failed: {e}")
     db = None
 
-# Pull from .env
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
 
@@ -92,21 +89,16 @@ def admin_required(f):
             decoded_token = firebase_auth.verify_id_token(token)
             email = decoded_token.get("email")
             
-            # 1. Master Admin Check (Bypasses database lookup)
             if email == ALLOWED_ADMIN_EMAIL:
                 return f(*args, **kwargs)
 
-            # 2. Sub-Admin Check (Verifies against Firestore)
             if db is not None:
                 admin_query = db.collection("admin_users").where("email", "==", email).limit(1).get()
-                
                 if len(admin_query) > 0:
                     admin_data = admin_query[0].to_dict()
-                    # Ensure they exist and are actively authorized
                     if admin_data.get("isAuthorized") == True:
                         return f(*args, **kwargs)
 
-            # If neither the Master Admin nor an authorized Sub-Admin matched, deny access
             return jsonify({"error": "Forbidden: Insufficient permissions"}), 403
 
         except Exception as e:
@@ -544,7 +536,15 @@ def get_isolated_seller_data():
     try:
         current_seller_email = request.seller_email 
         
-        # Macro Query
+        config_doc = db.collection("settings").document("financial_settings").get()
+        config = config_doc.to_dict() if config_doc.exists else {}
+        
+        commission_percent = float(config.get("platformCommission", 30.0))
+        tcs_percent = float(config.get("tcsRate", 1.0))
+        gst_threshold = float(config.get("gstThreshold", 2500.0))
+        gst_lower_rate = float(config.get("gstLowerRate", 5.0))
+        gst_upper_rate = float(config.get("gstUpperRate", 18.0))
+        
         orders_query = db.collection("orders").where("sellerEmails", "array_contains", current_seller_email).get()
         
         secure_wallet = {"available": 0, "pending": 0, "lifetime": 0}
@@ -557,20 +557,34 @@ def get_isolated_seller_data():
             if order_status not in ["paid", "delivered", "settled_override"]: 
                 continue
                 
-            # Micro Filter
             for item in order.get("items", []):
                 if item.get("sellerEmail") == current_seller_email:
-                    gross_item_revenue = float(item.get("price", 0)) * int(item.get("quantity", 1))
-                    jamba_fee = gross_item_revenue * 0.30
-                    net_seller_earnings = gross_item_revenue - jamba_fee
+                    item_price = float(item.get("price", 0))
+                    item_qty = int(item.get("quantity", 1))
+                    gross_item_revenue = item_price * item_qty
+                    
+                    jamba_fee = gross_item_revenue * (commission_percent / 100.0)
+                    commission_gst = jamba_fee * 0.18
+                    
+                    if item_price <= gst_threshold:
+                        product_gst_percent = gst_lower_rate
+                    else:
+                        product_gst_percent = gst_upper_rate
+                        
+                    net_product_value = gross_item_revenue / (1 + (product_gst_percent / 100.0))
+                    tcs_amount = net_product_value * (tcs_percent / 100.0)
+                    
+                    net_seller_earnings = gross_item_revenue - jamba_fee - commission_gst - tcs_amount
                     
                     isolated_sales_ledger.append({
                         "order_id": order.get("jamba_order_id", "N/A"),
                         "date": order.get("created_at"),
                         "product_name": item.get("name", item.get("title", "Product")),
-                        "qty": int(item.get("quantity", 1)),
+                        "qty": item_qty,
                         "gross": round(gross_item_revenue, 2),
                         "fee": round(jamba_fee, 2),
+                        "commission_gst": round(commission_gst, 2),
+                        "tcs": round(tcs_amount, 2),
                         "net": round(net_seller_earnings, 2),
                         "status": order_status
                     })
@@ -582,7 +596,6 @@ def get_isolated_seller_data():
                     
                     secure_wallet["lifetime"] += net_seller_earnings
 
-        # Subtract withdrawn payouts
         payouts_query = db.collection("payout_requests").where("email", "==", current_seller_email).get()
         for doc in payouts_query:
             amt = float(doc.to_dict().get("amount", 0))
@@ -604,7 +617,6 @@ def get_isolated_seller_data():
         logger.error(f"Pipeline error: {e}")
         return jsonify({"error": "Failed to securely route financial data"}), 500
 
-
 @app.route("/api/v1/seller/payouts/history", methods=["GET"])
 @seller_required
 def get_payout_history():
@@ -618,7 +630,6 @@ def get_payout_history():
         logger.error(f"History error: {e}")
         return jsonify({"error": "Failed to load history"}), 500
 
-
 @app.route("/api/v1/seller/payouts/request", methods=["POST"])
 @seller_required
 def request_payout():
@@ -628,15 +639,11 @@ def request_payout():
         amount = float(data.get("amount", 0))
         if amount <= 0: return jsonify({"error": "Invalid payout amount"}), 400
             
-        gross_amount = round(amount / 0.7, 2)
         _, doc_ref = db.collection("payout_requests").add({
             "email": request.seller_email,
             "brand": data.get("brand", "Unknown Brand"),
             "amount": amount,      
             "netPayable": amount,   
-            "grossAmount": gross_amount,
-            "jambaFee": round(gross_amount - amount, 2),
-            "deductions": 0,
             "status": "pending",
             "created_at": datetime.utcnow().isoformat(),
             "utr": ""
@@ -647,9 +654,149 @@ def request_payout():
         return jsonify({"error": "Failed to process request"}), 500
 
 # ==========================================
-# 9. RUN THE SERVER
+# 9. PROMO CODE ENGINE (ADMIN & SELLER)
+# ==========================================
+@app.route("/admin/promocodes", methods=["GET", "POST"])
+@admin_required
+def admin_promocodes():
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    
+    try:
+        if request.method == "GET":
+            docs = db.collection("promocodes").order_by("created_at", direction=firestore.Query.DESCENDING).get()
+            return jsonify([{**doc.to_dict(), "id": doc.id} for doc in docs]), 200
+            
+        if request.method == "POST":
+            data = request.get_json()
+            code = data.get("code", "").strip().upper()
+            
+            existing = db.collection("promocodes").where("code", "==", code).get()
+            if len(existing) > 0:
+                return jsonify({"error": f"Promo code {code} already exists!"}), 400
+                
+            promo_data = {
+                "code": code,
+                "type": data.get("type", "percentage"), 
+                "value": float(data.get("value", 0)),
+                "creator_role": "admin",
+                "seller_email": None,
+                "status": "active", 
+                "usage_limit": data.get("usage_limit", "unlimited"), 
+                "valid_from": data.get("valid_from"), 
+                "valid_until": data.get("valid_until"),
+                "used_by": [], 
+                "created_at": datetime.utcnow().isoformat()
+            }
+            _, doc_ref = db.collection("promocodes").add(promo_data)
+            return jsonify({"status": "success", "id": doc_ref.id}), 201
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/admin/promocodes/<doc_id>", methods=["PUT", "DELETE"])
+@admin_required
+def manage_promocode(doc_id):
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    try:
+        doc_ref = db.collection("promocodes").document(doc_id)
+        
+        if request.method == "PUT":
+            update_data = request.get_json()
+            doc_ref.update({"status": update_data.get("status", "pending")})
+            return jsonify({"status": "success"}), 200
+            
+        if request.method == "DELETE":
+            doc_ref.delete()
+            return jsonify({"status": "success"}), 200
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/v1/seller/promocodes", methods=["GET", "POST"])
+@seller_required
+def seller_promocodes():
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    try:
+        if request.method == "GET":
+            docs = db.collection("promocodes").where("seller_email", "==", request.seller_email).get()
+            promos = [{**doc.to_dict(), "id": doc.id} for doc in docs]
+            promos.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+            return jsonify(promos), 200
+
+        if request.method == "POST":
+            data = request.get_json()
+            code = data.get("code", "").strip().upper()
+
+            existing = db.collection("promocodes").where("code", "==", code).get()
+            if len(existing) > 0:
+                return jsonify({"error": f"Promo code {code} is already taken!"}), 400
+
+            promo_data = {
+                "code": code,
+                "type": data.get("type", "percentage"),
+                "value": float(data.get("value", 0)),
+                "creator_role": "seller",
+                "seller_email": request.seller_email,
+                "status": "pending", 
+                "usage_limit": data.get("usage_limit", "unlimited"),
+                "valid_from": data.get("valid_from"),
+                "valid_until": data.get("valid_until"),
+                "used_by": [],
+                "created_at": datetime.utcnow().isoformat()
+            }
+            _, doc_ref = db.collection("promocodes").add(promo_data)
+            return jsonify({"status": "success", "id": doc_ref.id}), 201
+
+    except Exception as e:
+        logger.error(f"Seller Promo Error: {e}")
+        return jsonify({"error": "Failed to process promo code"}), 500
+
+# ==========================================
+# 10. CUSTOMER CHECKOUT PROMO VALIDATION
+# ==========================================
+@app.route("/api/v1/promocodes/validate", methods=["POST"])
+def validate_promocode():
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    try:
+        data = request.get_json()
+        code = data.get("code", "").strip().upper()
+        customer_email = data.get("email", "").strip()
+
+        query = db.collection("promocodes").where("code", "==", code).limit(1).get()
+        if not query:
+            return jsonify({"error": "Invalid promo code"}), 404
+
+        promo = query[0].to_dict()
+
+        if promo.get("status") != "active":
+            return jsonify({"error": "Promo code is not active or awaiting approval"}), 400
+
+        # Time validation
+        now = datetime.utcnow().isoformat()
+        if promo.get("valid_from") and now < promo.get("valid_from"):
+            return jsonify({"error": "Promo code is not yet valid"}), 400
+        if promo.get("valid_until") and now > promo.get("valid_until"):
+            return jsonify({"error": "Promo code has expired"}), 400
+
+        # Usage limit validation
+        if promo.get("usage_limit") == "single":
+            if customer_email and customer_email in promo.get("used_by", []):
+                return jsonify({"error": "You have already used this promo code"}), 400
+
+        return jsonify({
+            "status": "success",
+            "type": promo.get("type"),
+            "value": promo.get("value"),
+            "creator_role": promo.get("creator_role"),
+            "seller_email": promo.get("seller_email")
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ==========================================
+# 11. RUN THE SERVER
 # ==========================================
 if __name__ == "__main__":
-    # Pull from .env or fallback to 5000
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
