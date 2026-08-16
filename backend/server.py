@@ -171,6 +171,14 @@ def create_order():
                 is_valid_usage = True
                 if temp_promo.get("usage_limit") == "single" and customer_email in temp_promo.get("used_by", []): is_valid_usage = False
                 
+                # --- NEW: STRICT PAYMENT METHOD ENFORCEMENT ---
+                promo_payment_method = temp_promo.get("applicable_payment_method", "all")
+                if promo_payment_method == "online" and payment_method.upper() == "COD":
+                    return jsonify({"error": "This promo code is strictly for Prepaid Online Orders."}), 400
+                if promo_payment_method == "cod" and payment_method.upper() != "COD":
+                    return jsonify({"error": "This promo code is only valid for Cash on Delivery orders."}), 400
+                # ----------------------------------------------
+
                 if is_valid_time and is_valid_usage:
                     promo_data = temp_promo
                     promo_doc_id = promo_query[0].id
@@ -736,6 +744,7 @@ def admin_promocodes():
                 "seller_email": None,
                 "status": "active", 
                 "usage_limit": data.get("usage_limit", "unlimited"), 
+                "applicable_payment_method": data.get("payment_method", "all"), 
                 "valid_from": data.get("valid_from"), 
                 "valid_until": data.get("valid_until"),
                 "used_by": [], 
@@ -789,6 +798,7 @@ def seller_promocodes():
                 "seller_email": request.seller_email,
                 "status": "pending", 
                 "usage_limit": data.get("usage_limit", "unlimited"),
+                "applicable_payment_method": data.get("payment_method", "all"), 
                 "valid_from": data.get("valid_from"),
                 "valid_until": data.get("valid_until"),
                 "used_by": [],
