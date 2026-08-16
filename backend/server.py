@@ -4,7 +4,7 @@
 import os
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import wraps
 
 from flask import Flask, request, jsonify
@@ -162,22 +162,32 @@ def create_order():
             promo_query = db.collection("promocodes").where("code", "==", promo_code_str).where("status", "==", "active").limit(1).get()
             if promo_query:
                 temp_promo = promo_query[0].to_dict()
-                now = datetime.utcnow().isoformat()
+                
+                # FIXED TIMEZONE CHECK
+                now = datetime.now(timezone.utc).isoformat()
                 
                 is_valid_time = True
-                if temp_promo.get("valid_from") and now < temp_promo.get("valid_from"): is_valid_time = False
-                if temp_promo.get("valid_until") and now > temp_promo.get("valid_until"): is_valid_time = False
+                if temp_promo.get("valid_from"):
+                    promo_start = temp_promo.get("valid_from")
+                    if not promo_start.endswith("Z") and "+" not in promo_start:
+                        promo_start += "+05:30"  # Force IST if naive
+                    if now < promo_start: is_valid_time = False
+                        
+                if temp_promo.get("valid_until"):
+                    promo_end = temp_promo.get("valid_until")
+                    if not promo_end.endswith("Z") and "+" not in promo_end:
+                        promo_end += "+05:30" # Force IST if naive
+                    if now > promo_end: is_valid_time = False
                 
                 is_valid_usage = True
                 if temp_promo.get("usage_limit") == "single" and customer_email in temp_promo.get("used_by", []): is_valid_usage = False
                 
-                # --- NEW: STRICT PAYMENT METHOD ENFORCEMENT ---
+                # STRICT PAYMENT METHOD ENFORCEMENT
                 promo_payment_method = temp_promo.get("applicable_payment_method", "all")
                 if promo_payment_method == "online" and payment_method.upper() == "COD":
                     return jsonify({"error": "This promo code is strictly for Prepaid Online Orders."}), 400
                 if promo_payment_method == "cod" and payment_method.upper() != "COD":
                     return jsonify({"error": "This promo code is only valid for Cash on Delivery orders."}), 400
-                # ----------------------------------------------
 
                 if is_valid_time and is_valid_usage:
                     promo_data = temp_promo
@@ -254,7 +264,7 @@ def create_order():
             "status": "pending",
             "payment_method": payment_method,
             "shippingAddress": shipping_address,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
             "sellerEmails": list(seller_emails_set)
         }
 
@@ -264,6 +274,8 @@ def create_order():
             })
 
         if payment_method == "COD":
+            # FIXED: Set status to processing for COD so it doesn't get hidden as abandoned
+            order_data["status"] = "processing"
             order_data["order_id"] = f"cod_{int(datetime.now().timestamp())}"
             db.collection("orders").add(order_data)
             return jsonify({"status": "success", "payment_method": "COD", "order_id": order_data["jamba_order_id"]}), 201
@@ -328,7 +340,7 @@ def admin_products():
     if request.method == "POST":
         try:
             data = request.get_json()
-            data["created_at"] = datetime.utcnow().isoformat()
+            data["created_at"] = datetime.now(timezone.utc).isoformat()
             _, doc_ref = db.collection("products").add(data)
             return jsonify({"status": "success", "id": doc_ref.id}), 201
         except Exception as e: 
@@ -404,7 +416,7 @@ def admin_settings(doc_id):
             return jsonify({"tribes": []} if doc_id == "tribe_categories" else {}), 200
         if request.method == "PUT":
             data = request.get_json()
-            if doc_id == "tribe_categories": data["last_updated"] = datetime.utcnow().isoformat()
+            if doc_id == "tribe_categories": data["last_updated"] = datetime.now(timezone.utc).isoformat()
             db.collection("settings").document(doc_id).set(data, merge=True)
             return jsonify({"status": "Settings updated"}), 200
     except Exception as e:
@@ -427,7 +439,7 @@ def admin_sellers():
         if request.method == "POST":
             email = request.get_json().get("email")
             db.collection("authorized_sellers").document(email).set({
-                "email": email, "addedAt": datetime.utcnow().isoformat(), "addedBy": ALLOWED_ADMIN_EMAIL
+                "email": email, "addedAt": datetime.now(timezone.utc).isoformat(), "addedBy": ALLOWED_ADMIN_EMAIL
             })
             return jsonify({"status": "Seller authorized"}), 201
     except Exception as e:
@@ -453,7 +465,7 @@ def admin_seller_profile(email):
             
         if request.method == "PUT":
             data = request.get_json()
-            data["updated_at"] = datetime.utcnow().isoformat()
+            data["updated_at"] = datetime.now(timezone.utc).isoformat()
             db.collection("seller_profiles").document(email).set(data, merge=True)
             return jsonify({"status": "Profile updated"}), 200
     except Exception as e:
@@ -548,9 +560,9 @@ def inject_financial_adjustment():
         brand = data.get("brand", "Global Correction")
         amount = float(data.get("amount", 0))
         db.collection("transactions").add({
-            "txId": f"ADJ-{int(datetime.utcnow().timestamp())}",
-            "date": datetime.utcnow().strftime("%d %b %Y"),
-            "created_at": datetime.utcnow().isoformat(),
+            "txId": f"ADJ-{int(datetime.now(timezone.utc).timestamp())}",
+            "date": datetime.now(timezone.utc).strftime("%d %b %Y"),
+            "created_at": datetime.now(timezone.utc).isoformat(),
             "type": "Bonus" if amount >= 0 else "Penalty",
             "brand": brand,
             "amount": f"+ ₹{amount}" if amount >= 0 else f"- ₹{abs(amount)}",
@@ -576,9 +588,9 @@ def update_payout(payout_id):
             pinfo = payout_doc.to_dict()
             amount = pinfo.get("amount", pinfo.get("netPayable", 0))
             db.collection("transactions").add({
-                "txId": f"TXN-{int(datetime.utcnow().timestamp())}",
-                "date": datetime.utcnow().strftime("%d %b %Y"),
-                "created_at": datetime.utcnow().isoformat(),
+                "txId": f"TXN-{int(datetime.now(timezone.utc).timestamp())}",
+                "date": datetime.now(timezone.utc).strftime("%d %b %Y"),
+                "created_at": datetime.now(timezone.utc).isoformat(),
                 "type": "Payout",
                 "brand": pinfo.get("brand", "Unknown Seller"),
                 "amount": f"- ₹{amount}",
@@ -617,7 +629,8 @@ def get_isolated_seller_data():
             order = doc.to_dict()
             order_status = order.get("status", "pending")
             
-            if order_status not in ["paid", "delivered", "settled_override"]: 
+            # FIXED: Added "processing" to the allowed list so COD orders are counted
+            if order_status not in ["paid", "processing", "delivered", "settled_override"]: 
                 continue
                 
             for item in order.get("items", []):
@@ -654,7 +667,8 @@ def get_isolated_seller_data():
                     
                     if order_status in ["delivered", "settled_override"]:
                         secure_wallet["available"] += net_seller_earnings
-                    elif order_status == "paid":
+                    # FIXED: Added "processing" to pending funds logic
+                    elif order_status in ["paid", "processing"]:
                         secure_wallet["pending"] += net_seller_earnings
                     
                     secure_wallet["lifetime"] += net_seller_earnings
@@ -708,7 +722,7 @@ def request_payout():
             "amount": amount,      
             "netPayable": amount,   
             "status": "pending",
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
             "utr": ""
         })
         return jsonify({"status": "success", "id": doc_ref.id}), 201
@@ -748,7 +762,7 @@ def admin_promocodes():
                 "valid_from": data.get("valid_from"), 
                 "valid_until": data.get("valid_until"),
                 "used_by": [], 
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat()
             }
             _, doc_ref = db.collection("promocodes").add(promo_data)
             return jsonify({"status": "success", "id": doc_ref.id}), 201
@@ -802,7 +816,7 @@ def seller_promocodes():
                 "valid_from": data.get("valid_from"),
                 "valid_until": data.get("valid_until"),
                 "used_by": [],
-                "created_at": datetime.utcnow().isoformat()
+                "created_at": datetime.now(timezone.utc).isoformat()
             }
             _, doc_ref = db.collection("promocodes").add(promo_data)
             return jsonify({"status": "success", "id": doc_ref.id}), 201
@@ -830,11 +844,23 @@ def validate_promocode():
         if promo.get("status") != "active":
             return jsonify({"error": "Promo code is not active or awaiting approval"}), 400
 
-        now = datetime.utcnow().isoformat()
-        if promo.get("valid_from") and now < promo.get("valid_from"):
-            return jsonify({"error": "Promo code is not yet valid"}), 400
-        if promo.get("valid_until") and now > promo.get("valid_until"):
-            return jsonify({"error": "Promo code has expired"}), 400
+        # FIXED TIMEZONE CHECK
+        now = datetime.now(timezone.utc).isoformat()
+        
+        if promo.get("valid_from"):
+            promo_start = promo.get("valid_from")
+            # If the date from Firebase doesn't specify a timezone, append IST (+05:30)
+            if not promo_start.endswith("Z") and "+" not in promo_start:
+                promo_start += "+05:30" 
+            if now < promo_start:
+                return jsonify({"error": "Promo code is not yet valid"}), 400
+                
+        if promo.get("valid_until"):
+            promo_end = promo.get("valid_until")
+            if not promo_end.endswith("Z") and "+" not in promo_end:
+                promo_end += "+05:30"
+            if now > promo_end:
+                return jsonify({"error": "Promo code has expired"}), 400
 
         if promo.get("usage_limit") == "single":
             if customer_email and customer_email in promo.get("used_by", []):
