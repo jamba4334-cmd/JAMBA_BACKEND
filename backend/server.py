@@ -39,10 +39,6 @@ CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}})
 
 ALLOWED_ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "jamba4334@gmail.com")
 
-# 🔥 STRIP ALL ACCIDENTAL QUOTES FROM THE .ENV VARIABLE
-raw_key = os.getenv("TEMP_BACKEND_KEY", "jamba_master_key_2026")
-TEMP_BACKEND_KEY = raw_key.strip().strip('"').strip("'")
-
 # ==========================================
 # 3. INITIALIZE SERVICES
 # ==========================================
@@ -92,10 +88,6 @@ def admin_required(f):
         
         token = auth_header.split(" ")[1].strip().strip('"\'')
 
-        # 🔥 TEMPORARY MASTER BYPASS
-        if token == TEMP_BACKEND_KEY or token == "jamba_master_key_2026":
-            return f(*args, **kwargs)
-
         try:
             decoded_token = firebase_auth.verify_id_token(token)
             email = decoded_token.get("email")
@@ -126,11 +118,6 @@ def seller_required(f):
             return jsonify({"error": "Unauthorized"}), 401
         
         token = auth_header.split(" ")[1].strip().strip('"\'')
-
-        # 🔥 TEMPORARY MASTER BYPASS
-        if token == TEMP_BACKEND_KEY or token == "jamba_master_key_2026":
-            request.seller_email = ALLOWED_ADMIN_EMAIL # Default to Admin email for bypass logs
-            return f(*args, **kwargs)
 
         try:
             decoded_token = firebase_auth.verify_id_token(token)
@@ -478,61 +465,29 @@ def remove_seller(email):
 
 # 🔥 BRUTE-FORCE AUTH CHECK FOR STOREFRONT LAYOUTS
 @app.route("/admin/seller_profiles/<email>", methods=["GET", "PUT"])
+@admin_required
 def admin_seller_profile(email):
-    if db is None: return jsonify({"error": "Database unavailable"}), 503
-    
-    auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        return jsonify({"error": "Unauthorized: Missing token"}), 401
-        
-    token = auth_header.split(" ")[1].strip().strip('"\'')
-    
-    print(f"\n🔥 DEBUG FRONTEND TOKEN RECEIVED: {token}")
-    print(f"🔥 DEBUG EXPECTED OVERRIDE KEY: {TEMP_BACKEND_KEY}\n")
-    
-    is_admin = False
-    is_owner = False
+    if db is None:
+        return jsonify({"error": "Database unavailable"}), 503
 
-    # 🔥 BRUTE-FORCE MASTER BYPASS
-    if token == TEMP_BACKEND_KEY or token == "jamba_master_key_2026":
-        print("✅ BYPASS GRANTED: Saving Storefront without Firebase verification.")
-        is_admin = True
-    else:
-        try:
-            decoded_token = firebase_auth.verify_id_token(token)
-            req_email = decoded_token.get("email")
-            
-            # Check if user is Admin
-            if req_email == ALLOWED_ADMIN_EMAIL:
-                is_admin = True
-            else:
-                admin_query = db.collection("admin_users").where("email", "==", req_email).limit(1).get()
-                if len(admin_query) > 0 and admin_query[0].to_dict().get("isAuthorized") == True:
-                    is_admin = True
-                    
-            # Check if user is Store Owner
-            if req_email == email:
-                is_owner = True
-                seller_doc = db.collection("authorized_sellers").document(req_email).get()
-                if not seller_doc.exists:
-                    is_owner = False
-                    
-        except Exception as e:
-            print(f"❌ FIREBASE REJECTED TOKEN: {e}")
-            return jsonify({"error": "Unauthorized: Invalid or expired token"}), 401
-            
-    if not is_admin and not is_owner:
-        return jsonify({"error": "Forbidden: You do not have permission to edit this storefront."}), 403
+    target_email = email.strip().lower()
+    profile_ref = db.collection("seller_profiles").document(target_email)
 
-    if request.method == "GET":
-        doc = db.collection("seller_profiles").document(email).get()
-        return jsonify(doc.to_dict() if doc.exists else {}), 200
-        
-    if request.method == "PUT":
-        data = request.get_json()
+    try:
+        if request.method == "GET":
+            profile = profile_ref.get()
+            return jsonify(profile.to_dict() if profile.exists else {}), 200
+
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict) or not isinstance(data.get("storefront"), dict):
+            return jsonify({"error": "Invalid request: storefront data is required"}), 400
+
         data["updated_at"] = datetime.now(timezone.utc).isoformat()
-        db.collection("seller_profiles").document(email).set(data, merge=True)
+        profile_ref.set(data, merge=True)
         return jsonify({"status": "Profile updated"}), 200
+    except Exception:
+        logger.exception("Could not read or save seller storefront.")
+        return jsonify({"error": "Could not save seller storefront"}), 500
 
 # ==========================================
 # 7. ADMIN FINANCE & LEDGERS
