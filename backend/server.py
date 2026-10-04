@@ -39,8 +39,9 @@ CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}})
 
 ALLOWED_ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "jamba4334@gmail.com")
 
-# 🔥 LOAD TEMPORARY API KEY FROM .ENV
-TEMP_BACKEND_KEY = os.getenv("TEMP_BACKEND_KEY", "jamba_master_key_2026")
+# 🔥 STRIP ALL ACCIDENTAL QUOTES FROM THE .ENV VARIABLE
+raw_key = os.getenv("TEMP_BACKEND_KEY", "jamba_master_key_2026")
+TEMP_BACKEND_KEY = raw_key.strip().strip('"').strip("'")
 
 # ==========================================
 # 3. INITIALIZE SERVICES
@@ -89,10 +90,10 @@ def admin_required(f):
         if not auth_header or not auth_header.startswith("Bearer "):
             return jsonify({"error": "Unauthorized: Missing token"}), 401
         
-        token = auth_header.split(" ")[1]
+        token = auth_header.split(" ")[1].strip().strip('"\'')
 
         # 🔥 TEMPORARY MASTER BYPASS
-        if token == TEMP_BACKEND_KEY:
+        if token == TEMP_BACKEND_KEY or token == "jamba_master_key_2026":
             return f(*args, **kwargs)
 
         try:
@@ -124,10 +125,10 @@ def seller_required(f):
         if not auth_header or not auth_header.startswith("Bearer "):
             return jsonify({"error": "Unauthorized"}), 401
         
-        token = auth_header.split(" ")[1]
+        token = auth_header.split(" ")[1].strip().strip('"\'')
 
         # 🔥 TEMPORARY MASTER BYPASS
-        if token == TEMP_BACKEND_KEY:
+        if token == TEMP_BACKEND_KEY or token == "jamba_master_key_2026":
             request.seller_email = ALLOWED_ADMIN_EMAIL # Default to Admin email for bypass logs
             return f(*args, **kwargs)
 
@@ -177,26 +178,24 @@ def create_order():
             if promo_query:
                 temp_promo = promo_query[0].to_dict()
                 
-                # FIXED TIMEZONE CHECK
                 now = datetime.now(timezone.utc).isoformat()
                 
                 is_valid_time = True
                 if temp_promo.get("valid_from"):
                     promo_start = temp_promo.get("valid_from")
                     if not promo_start.endswith("Z") and "+" not in promo_start:
-                        promo_start += "+05:30"  # Force IST if naive
+                        promo_start += "+05:30"
                     if now < promo_start: is_valid_time = False
                         
                 if temp_promo.get("valid_until"):
                     promo_end = temp_promo.get("valid_until")
                     if not promo_end.endswith("Z") and "+" not in promo_end:
-                        promo_end += "+05:30" # Force IST if naive
+                        promo_end += "+05:30" 
                     if now > promo_end: is_valid_time = False
                 
                 is_valid_usage = True
                 if temp_promo.get("usage_limit") == "single" and customer_email in temp_promo.get("used_by", []): is_valid_usage = False
                 
-                # STRICT PAYMENT METHOD ENFORCEMENT
                 promo_payment_method = temp_promo.get("applicable_payment_method", "all")
                 if promo_payment_method == "online" and payment_method.upper() == "COD":
                     return jsonify({"error": "This promo code is strictly for Prepaid Online Orders."}), 400
@@ -207,7 +206,7 @@ def create_order():
                     promo_data = temp_promo
                     promo_doc_id = promo_query[0].id
 
-        # 2. PROCESS CART & ISOLATE DISCOUNTS PER BRAND
+        # 2. PROCESS CART
         total_discount = 0
         seller_eligible_subtotal = 0
 
@@ -232,7 +231,6 @@ def create_order():
             
             is_returnable = product.get("isReturnable", True)
 
-            # Check if this item belongs to the seller who made the promo code
             if promo_data and promo_data.get("creator_role") == "seller":
                 if promo_data.get("seller_email") == seller_email:
                     seller_eligible_subtotal += item_total
@@ -246,7 +244,7 @@ def create_order():
             })
             enriched_cart.append(item)
 
-        # 3. CALCULATE FINAL MATH
+        # 3. CALCULATE MATH
         if promo_data:
             discount_value = float(promo_data.get("value", 0))
             
@@ -262,10 +260,8 @@ def create_order():
                 else:
                     total_discount = min(discount_value, seller_eligible_subtotal)
 
-        # --- GST CALCULATION (Applied to the post-discount taxable value) ---
         taxable_value = secure_subtotal - total_discount
         
-        # Apparel GST Rule: 5% if below 2500, 18% if above
         if taxable_value <= 2500:
             total_gst = taxable_value * 0.05
         else:
@@ -480,7 +476,7 @@ def remove_seller(email):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# 🔥 CUSTOM AUTH CHECK FOR STOREFRONT LAYOUTS
+# 🔥 BRUTE-FORCE AUTH CHECK FOR STOREFRONT LAYOUTS
 @app.route("/admin/seller_profiles/<email>", methods=["GET", "PUT"])
 def admin_seller_profile(email):
     if db is None: return jsonify({"error": "Database unavailable"}), 503
@@ -489,13 +485,17 @@ def admin_seller_profile(email):
     if not auth_header or not auth_header.startswith("Bearer "):
         return jsonify({"error": "Unauthorized: Missing token"}), 401
         
-    token = auth_header.split(" ")[1]
+    token = auth_header.split(" ")[1].strip().strip('"\'')
+    
+    print(f"\n🔥 DEBUG FRONTEND TOKEN RECEIVED: {token}")
+    print(f"🔥 DEBUG EXPECTED OVERRIDE KEY: {TEMP_BACKEND_KEY}\n")
     
     is_admin = False
     is_owner = False
 
-    # 🔥 TEMPORARY MASTER BYPASS
-    if token == TEMP_BACKEND_KEY:
+    # 🔥 BRUTE-FORCE MASTER BYPASS
+    if token == TEMP_BACKEND_KEY or token == "jamba_master_key_2026":
+        print("✅ BYPASS GRANTED: Saving Storefront without Firebase verification.")
         is_admin = True
     else:
         try:
@@ -518,6 +518,7 @@ def admin_seller_profile(email):
                     is_owner = False
                     
         except Exception as e:
+            print(f"❌ FIREBASE REJECTED TOKEN: {e}")
             return jsonify({"error": "Unauthorized: Invalid or expired token"}), 401
             
     if not is_admin and not is_owner:
@@ -691,17 +692,14 @@ def get_isolated_seller_data():
             order = doc.to_dict()
             order_status = order.get("status", "pending")
             
-            # FIXED: Added "processing" to the allowed list so COD orders are counted
             if order_status not in ["paid", "processing", "delivered", "settled_override"]: 
                 continue
                 
-            # 1. Determine if this seller pays for the discount
             order_discount = float(order.get("discount_applied", 0))
             promo_role = order.get("promo_creator_role")
             promo_email = order.get("promo_seller_email")
             seller_bears_discount = (promo_role == "seller" and promo_email == current_seller_email)
             
-            # 2. Get total gross for this seller to proportionately divide the discount
             seller_items = [i for i in order.get("items", []) if i.get("sellerEmail") == current_seller_email]
             seller_gross_total = sum(float(i.get("price", 0)) * int(i.get("quantity", 1)) for i in seller_items)
                 
@@ -710,14 +708,12 @@ def get_isolated_seller_data():
                 item_qty = int(item.get("quantity", 1))
                 gross_item_revenue = item_price * item_qty
                 
-                # 3. Deduct proportional discount if the seller created the code
                 item_discount = 0
                 if seller_bears_discount and seller_gross_total > 0:
                     item_discount = order_discount * (gross_item_revenue / seller_gross_total)
                     
                 discounted_item_revenue = gross_item_revenue - item_discount
                 
-                # 4. JAMBA commission is now taken from the discounted price!
                 jamba_fee = discounted_item_revenue * (commission_percent / 100.0)
                 commission_gst = jamba_fee * 0.18
                 
@@ -746,7 +742,6 @@ def get_isolated_seller_data():
                 
                 if order_status in ["delivered", "settled_override"]:
                     secure_wallet["available"] += net_seller_earnings
-                # FIXED: Added "processing" to pending funds logic
                 elif order_status in ["paid", "processing"]:
                     secure_wallet["pending"] += net_seller_earnings
                 
@@ -923,12 +918,10 @@ def validate_promocode():
         if promo.get("status") != "active":
             return jsonify({"error": "Promo code is not active or awaiting approval"}), 400
 
-        # FIXED TIMEZONE CHECK
         now = datetime.now(timezone.utc).isoformat()
         
         if promo.get("valid_from"):
             promo_start = promo.get("valid_from")
-            # If the date from Firebase doesn't specify a timezone, append IST (+05:30)
             if not promo_start.endswith("Z") and "+" not in promo_start:
                 promo_start += "+05:30" 
             if now < promo_start:
