@@ -17,6 +17,8 @@ from firebase_admin import credentials, firestore, auth as firebase_auth
 
 from fpdf import FPDF
 import io
+import re
+import uuid
 
 # Load environment variables from the .env file
 load_dotenv()
@@ -33,10 +35,84 @@ logger = logging.getLogger("jambawear_api")
 
 app = Flask(__name__)
 
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
-CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}})
+# SECURITY: never fall back to "*". Set ALLOWED_ORIGINS=https://jambawear.in,https://www.jambawear.in
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",") if o.strip()]
+CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}},
+     allow_headers=["Authorization", "Content-Type"], methods=["GET", "POST", "PUT", "DELETE"], max_age=600)
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2 MB request cap
 
-ALLOWED_ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "jamba4334@gmail.com")
+# SECURITY: super-admin email comes only from the environment (set ADMIN_EMAIL in .env).
+ALLOWED_ADMIN_EMAIL = (os.getenv("ADMIN_EMAIL") or "").strip().lower()
+
+# ==========================================
+# INPUT VALIDATION HELPERS
+# ==========================================
+EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,190}\.[A-Za-z]{2,}$")
+DOC_ID_RE = re.compile(r"^[A-Za-z0-9_\-@.]{1,128}$")
+PROMO_RE = re.compile(r"^[A-Z0-9_-]{3,24}$")
+
+class BadInput(ValueError):
+    pass
+
+def v_email(value, field="email"):
+    v = str(value or "").strip().lower()
+    if not EMAIL_RE.match(v): raise BadInput(f"Invalid {field}")
+    return v
+
+def v_doc_id(value, field="id"):
+    v = str(value or "").strip()
+    if not DOC_ID_RE.match(v) or "/" in v: raise BadInput(f"Invalid {field}")
+    return v
+
+def v_int(value, lo, hi, field="number"):
+    try: n = int(value)
+    except (TypeError, ValueError): raise BadInput(f"Invalid {field}")
+    if n < lo or n > hi: raise BadInput(f"{field} out of range")
+    return n
+
+def v_float(value, lo, hi, field="amount"):
+    try: n = float(value)
+    except (TypeError, ValueError): raise BadInput(f"Invalid {field}")
+    if n != n or n < lo or n > hi: raise BadInput(f"{field} out of range")
+    return round(n, 2)
+
+def v_choice(value, choices, field="value"):
+    v = str(value or "").strip().lower()
+    if v not in choices: raise BadInput(f"Invalid {field}")
+    return v
+
+def v_str(value, max_len=200, field="text"):
+    v = str(value or "").strip()
+    if len(v) > max_len: raise BadInput(f"{field} too long")
+    return v
+
+def pick(data, allowed):
+    """Allow-list fields to stop mass-assignment of arbitrary keys."""
+    return {k: data[k] for k in allowed if k in data}
+
+PRODUCT_FIELDS = ["name", "description", "selling_price", "mrp", "category", "tribe", "images",
+                  "sizes", "colors", "stock", "isReturnable", "brandName", "sellerName",
+                  "sellerEmail", "item_id", "status", "tags", "hsn", "weight"]
+ORDER_ADMIN_FIELDS = ["status", "tracking_id", "courier", "admin_note", "delivered_at", "return_status"]
+PAYOUT_ADMIN_FIELDS = ["status", "utr", "admin_note"]
+
+@app.errorhandler(BadInput)
+def handle_bad_input(e):
+    return jsonify({"error": str(e)}), 400
+
+@app.errorhandler(413)
+def handle_too_large(_e):
+    return jsonify({"error": "Request too large"}), 413
+
+@app.errorhandler(404)
+def handle_404(_e):
+    return jsonify({"error": "Not found"}), 404
+
+@app.errorhandler(Exception)
+def handle_unexpected(e):
+    # SECURITY: log full details server-side only, never return them.
+    logger.error("Unhandled error", exc_info=True)
+    return jsonify({"error": "Internal server error"}), 500
 
 # ==========================================
 # 3. INITIALIZE SERVICES
@@ -86,65 +162,71 @@ def apply_security_headers(response):
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     # Note: If your frontend and backend are on different domains, 'self' restricts fetching. 
     # Modify default-src or connect-src if you host API and frontend separately.
-    response.headers["Content-Security-Policy"] = "default-src 'self' https: data: 'unsafe-inline'"
+    # API returns JSON/PDF only, so lock CSP down completely.
+    response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Cross-Origin-Resource-Policy"] = "same-site"
+    if request.path.startswith(("/admin", "/api/v1/seller")) or request.headers.get("Authorization"):
+        response.headers["Cache-Control"] = "no-store"
+    response.headers.pop("Server", None)
     return response
+
+def _verify_bearer():
+    """Returns decoded Firebase token or None. Rejects revoked tokens and unverified emails."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header[7:].strip()
+    if not token or len(token) > 4096:
+        return None
+    try:
+        decoded = firebase_auth.verify_id_token(token, check_revoked=True)
+    except Exception:
+        return None
+    # SECURITY: an attacker can register email/password with someone else's address.
+    # Only trust emails Firebase has verified (Google sign-in is always verified).
+    if not decoded.get("email") or decoded.get("email_verified") is not True:
+        return None
+    return decoded
 
 def admin_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        auth_header = request.headers.get("Authorization")
-        if not auth_header or not auth_header.startswith("Bearer "):
-            return jsonify({"error": "Unauthorized: Missing token"}), 401
-        
-        token = auth_header.split(" ")[1].strip().strip('"\'')
-
-        try:
-            decoded_token = firebase_auth.verify_id_token(token)
-            email = decoded_token.get("email")
-            
-            if email == ALLOWED_ADMIN_EMAIL:
-                return f(*args, **kwargs)
-
-            if db is not None:
-                admin_query = db.collection("admin_users").where("email", "==", email).limit(1).get()
-                if len(admin_query) > 0:
-                    admin_data = admin_query[0].to_dict()
-                    if admin_data.get("isAuthorized") == True:
-                        return f(*args, **kwargs)
-
-            return jsonify({"error": "Forbidden: Insufficient permissions"}), 403
-
-        except Exception as e:
-            return jsonify({"error": "Unauthorized: Invalid or expired token"}), 401
-            
-        return f(*args, **kwargs)
+        decoded = _verify_bearer()
+        if not decoded:
+            return jsonify({"error": "Unauthorized"}), 401
+        email = decoded["email"].lower()
+        if db is None:
+            return jsonify({"error": "Service unavailable"}), 503
+        if ALLOWED_ADMIN_EMAIL and email == ALLOWED_ADMIN_EMAIL:
+            request.admin_email = email
+            return f(*args, **kwargs)
+        admin_doc = db.collection("admin_users").document(email).get()
+        if admin_doc.exists and admin_doc.to_dict().get("isAuthorized") is True:
+            request.admin_email = email
+            return f(*args, **kwargs)
+        return jsonify({"error": "Forbidden"}), 403
     return decorated_function
 
 def seller_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        auth_header = request.headers.get("Authorization")
-        if not auth_header or not auth_header.startswith("Bearer "):
+        decoded = _verify_bearer()
+        if not decoded:
             return jsonify({"error": "Unauthorized"}), 401
-        
-        token = auth_header.split(" ")[1].strip().strip('"\'')
-
-        try:
-            decoded_token = firebase_auth.verify_id_token(token)
-            email = decoded_token.get("email")
-            if not email:
-                return jsonify({"error": "Invalid token payload"}), 401
-            
-            seller_doc = db.collection("authorized_sellers").document(email).get()
-            if not seller_doc.exists:
-                return jsonify({"error": "Forbidden: Seller account not found"}), 403
-                
-            request.seller_email = email
-        except Exception as e:
-            return jsonify({"error": "Unauthorized: Invalid token"}), 401
-            
+        if db is None:
+            return jsonify({"error": "Service unavailable"}), 503
+        email = decoded["email"].lower()
+        if not db.collection("authorized_sellers").document(email).get().exists:
+            return jsonify({"error": "Forbidden"}), 403
+        request.seller_email = email
         return f(*args, **kwargs)
     return decorated_function
+
+def optional_user():
+    """Decoded token for customers (may be None for guest checkout)."""
+    return _verify_bearer()
 
 # ==========================================
 # 5. PUBLIC ROUTES (Customer Facing)
@@ -168,12 +250,20 @@ def create_order():
         if not isinstance(cart, list) or len(cart) == 0:
             return jsonify({"error": "Cart cannot be empty."}), 400
 
-        customer_email = str(data.get("customer", "guest@jambawear.com")).strip()
-        shipping_address = data.get("shippingAddress", {})
-        if not isinstance(shipping_address, dict):
-            shipping_address = {}
+        if len(cart) > 50:
+            return jsonify({"error": "Too many items in cart."}), 400
+        # SECURITY: identity comes from the verified token, not the request body,
+        # so a user cannot spend someone else's single-use promo.
+        user = optional_user()
+        customer_email = user["email"].lower() if user else v_email(data.get("customer"), "customer email")
+        customer_uid = user["uid"] if user else None
+        raw_addr = data.get("shippingAddress", {})
+        if not isinstance(raw_addr, dict):
+            raw_addr = {}
+        shipping_address = {k: v_str(raw_addr.get(k, ""), 200, k) for k in
+                            ["name", "phone", "line1", "line2", "city", "state", "pincode", "landmark"]}
             
-        payment_method = str(data.get("payment_method", "Razorpay")).strip()
+        payment_method = "COD" if str(data.get("payment_method", "Razorpay")).strip().upper() == "COD" else "Razorpay"
         promo_code_str = str(data.get("promo_code", "")).strip().upper()
 
         secure_subtotal = 0
@@ -220,11 +310,11 @@ def create_order():
         seller_eligible_subtotal = 0
 
         for item in cart:
-            item_id = str(item.get("id"))
-            try:
-                quantity = int(item.get("quantity", 1))
-            except ValueError:
-                quantity = 1
+            if not isinstance(item, dict):
+                return jsonify({"error": "Invalid cart item."}), 400
+            item_id = v_doc_id(item.get("id"), "product id")
+            # SECURITY: negative/huge quantities previously produced negative totals.
+            quantity = v_int(item.get("quantity", 1), 1, 20, "quantity")
             
             doc_ref = db.collection("products").document(item_id).get()
             if not doc_ref.exists:
@@ -247,13 +337,18 @@ def create_order():
                 if promo_data.get("seller_email") == seller_email:
                     seller_eligible_subtotal += item_total
 
-            item.update({
+            item = {
+                "id": item_id,
+                "quantity": quantity,
+                "size": v_str(item.get("size", ""), 20, "size"),
+                "color": v_str(item.get("color", ""), 40, "color"),
+                "name": product.get("name", ""),
                 "price": real_price,
                 "brandName": product.get("brandName", ""),
                 "sellerName": product.get("sellerName", ""),
                 "sellerEmail": seller_email,
                 "isReturnable": is_returnable
-            })
+            }
             enriched_cart.append(item)
 
         # 3. CALCULATE MATH
@@ -281,11 +376,14 @@ def create_order():
 
         shipping_fee = 149 if secure_subtotal < 1999 else 0
         final_total = max(taxable_value + shipping_fee, 0)
-        unique_jamba_id = "JB" + datetime.now(timezone.utc).strftime("%y%m%d%H%M%S")
+        if final_total <= 0 or final_total > 1_000_000:
+            return jsonify({"error": "Invalid order total."}), 400
+        unique_jamba_id = "JB" + datetime.now(timezone.utc).strftime("%y%m%d") + uuid.uuid4().hex[:6].upper()
 
         order_data = {
             "jamba_order_id": unique_jamba_id,
             "email": customer_email,
+            "userId": customer_uid,
             "items": enriched_cart,
             "subtotal": secure_subtotal,
             "discount_applied": total_discount,
@@ -343,9 +441,11 @@ def verify_payment():
         if not data:
             return jsonify({"error": "Invalid payload."}), 400
             
-        razorpay_order_id = data.get("razorpay_order_id")
-        rose_payment_id = data.get("razorpay_payment_id")
-        razorpay_signature = data.get("razorpay_signature")
+        razorpay_order_id = v_str(data.get("razorpay_order_id"), 64, "order id")
+        rose_payment_id = v_str(data.get("razorpay_payment_id"), 64, "payment id")
+        razorpay_signature = v_str(data.get("razorpay_signature"), 128, "signature")
+        if not (razorpay_order_id and rose_payment_id and razorpay_signature):
+            return jsonify({"error": "Invalid payload."}), 400
 
         razorpay_client.utility.verify_payment_signature({
             "razorpay_order_id": razorpay_order_id,
@@ -375,10 +475,22 @@ def generate_invoice(order_id):
         return jsonify({"error": "Service unavailable"}), 503
         
     try:
+        order_id = v_doc_id(order_id, "order id")
+        # SECURITY: invoices contain name, address and phone - require the owner (or an admin).
+        user = optional_user()
+        if not user:
+            return jsonify({"error": "Unauthorized"}), 401
         order_doc = db.collection("orders").document(order_id).get()
         if not order_doc.exists:
             return jsonify({"error": "Order not found"}), 404
         order_data = order_doc.to_dict()
+        req_email = user["email"].lower()
+        is_owner = order_data.get("userId") == user["uid"] or (order_data.get("email") or "").lower() == req_email
+        is_seller = req_email in [e.lower() for e in order_data.get("sellerEmails", [])]
+        is_admin = (ALLOWED_ADMIN_EMAIL and req_email == ALLOWED_ADMIN_EMAIL) or (
+            (lambda d: d.exists and d.to_dict().get("isAuthorized") is True)(db.collection("admin_users").document(req_email).get()))
+        if not (is_owner or is_seller or is_admin):
+            return jsonify({"error": "Order not found"}), 404
 
         seller_email = order_data.get("sellerEmails", [""])[0]
         seller_app_doc = db.collection("authorized_sellers").document(seller_email).get()
@@ -475,7 +587,7 @@ def admin_products():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     if request.method == "GET":
         try:
-            limit = int(request.args.get("limit", 50))
+            limit = v_int(request.args.get("limit", 50), 1, 200, "limit")
             products = []
             docs = db.collection("products").order_by("created_at", direction=firestore.Query.DESCENDING).limit(limit).get()
             for doc in docs: products.append({**doc.to_dict(), "docId": doc.id})
@@ -487,7 +599,10 @@ def admin_products():
         try:
             data = request.get_json()
             if not isinstance(data, dict): return jsonify({"error": "Invalid payload"}), 400
+            data = pick(data, PRODUCT_FIELDS)
+            if "selling_price" in data: data["selling_price"] = v_float(data["selling_price"], 1, 1_000_000, "price")
             data["created_at"] = datetime.now(timezone.utc).isoformat()
+            data["created_by"] = request.admin_email
             _, doc_ref = db.collection("products").add(data)
             return jsonify({"status": "success", "id": doc_ref.id}), 201
         except Exception as e:
@@ -499,10 +614,13 @@ def admin_products():
 def admin_product_detail(doc_id):
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     try:
-        doc_ref = db.collection("products").document(doc_id)
+        doc_ref = db.collection("products").document(v_doc_id(doc_id))
         if request.method == "PUT":
             data = request.get_json()
             if not isinstance(data, dict): return jsonify({"error": "Invalid payload"}), 400
+            data = pick(data, PRODUCT_FIELDS)
+            if "selling_price" in data: data["selling_price"] = v_float(data["selling_price"], 1, 1_000_000, "price")
+            if not data: return jsonify({"error": "No valid fields"}), 400
             doc_ref.update(data)
             return jsonify({"status": "success"}), 200
         if request.method == "DELETE":
@@ -533,7 +651,10 @@ def update_order(order_id):
     try:
         data = request.get_json()
         if not isinstance(data, dict): return jsonify({"error": "Invalid payload"}), 400
-        db.collection("orders").document(order_id).update(data)
+        data = pick(data, ORDER_ADMIN_FIELDS)
+        if not data: return jsonify({"error": "No valid fields"}), 400
+        data["updated_by"] = request.admin_email
+        db.collection("orders").document(v_doc_id(order_id)).update(data)
         return jsonify({"status": "success"}), 200
     except Exception as e:
         logger.error(f"Error updating admin order {order_id}: {str(e)}", exc_info=True)
@@ -566,6 +687,7 @@ def admin_customers():
 @admin_required
 def admin_settings(doc_id):
     if db is None: return jsonify({"error": "Database unavailable"}), 503
+    doc_id = v_doc_id(doc_id, "settings id")
     try:
         if request.method == "GET":
             doc = db.collection("settings").document(doc_id).get()
@@ -598,10 +720,10 @@ def admin_sellers():
         if request.method == "POST":
             data = request.get_json()
             if not isinstance(data, dict): return jsonify({"error": "Invalid payload"}), 400
-            email = data.get("email")
+            email = v_email(data.get("email"))
             db.collection("authorized_sellers").document(email).set({
-                "email": email, "addedAt": datetime.now(timezone.utc).isoformat(), "addedBy": ALLOWED_ADMIN_EMAIL
-            })
+                "email": email, "addedAt": datetime.now(timezone.utc).isoformat(), "addedBy": request.admin_email
+            }, merge=True)
             return jsonify({"status": "Seller authorized"}), 201
     except Exception as e:
         logger.error(f"Error in admin sellers: {str(e)}", exc_info=True)
@@ -611,6 +733,7 @@ def admin_sellers():
 @admin_required
 def remove_seller(email):
     try:
+        email = v_email(email)
         db.collection("authorized_sellers").document(email).delete()
         return jsonify({"status": "Seller removed"}), 200
     except Exception as e:
@@ -623,7 +746,7 @@ def admin_seller_profile(email):
     if db is None:
         return jsonify({"error": "Database unavailable"}), 503
 
-    target_email = email.strip().lower()
+    target_email = v_email(email)
     profile_ref = db.collection("seller_profiles").document(target_email)
 
     try:
@@ -635,7 +758,7 @@ def admin_seller_profile(email):
         if not isinstance(data, dict) or not isinstance(data.get("storefront"), dict):
             return jsonify({"error": "Invalid request: storefront data is required"}), 400
 
-        data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        data = {"storefront": data["storefront"], "updated_at": datetime.now(timezone.utc).isoformat()}
         profile_ref.set(data, merge=True)
         return jsonify({"status": "Profile updated"}), 200
     except Exception as e:
@@ -756,10 +879,16 @@ def update_payout(payout_id):
     try:
         data = request.get_json()
         if not isinstance(data, dict): return jsonify({"error": "Invalid payload"}), 400
-        payout_ref = db.collection("payout_requests").document(payout_id)
+        payout_ref = db.collection("payout_requests").document(v_doc_id(payout_id))
         payout_doc = payout_ref.get()
         
         if not payout_doc.exists: return jsonify({"error": "Payout not found"}), 404
+        data = pick(data, PAYOUT_ADMIN_FIELDS)
+        if "status" in data: data["status"] = v_choice(data["status"], {"pending", "approved", "on_hold", "paid", "rejected"}, "status")
+        if "utr" in data: data["utr"] = v_str(data["utr"], 40, "UTR")
+        if not data: return jsonify({"error": "No valid fields"}), 400
+        data["updated_by"] = request.admin_email
+        data["updated_at"] = datetime.now(timezone.utc).isoformat()
         payout_ref.update(data)
         
         if data.get("status") == "paid":
@@ -897,6 +1026,39 @@ def get_payout_history():
         logger.error(f"History error for seller {request.seller_email}: {str(e)}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
 
+def compute_available_balance(seller_email):
+    """Server-side source of truth for what a seller can withdraw."""
+    cfg_doc = db.collection("platform_config").document("tax").get()
+    cfg = cfg_doc.to_dict() if cfg_doc.exists else {}
+    commission = float(cfg.get("commissionPct", 10)) / 100
+    gst_on_comm = float(cfg.get("gstOnCommissionPct", 18)) / 100
+    tcs = float(cfg.get("tcsPct", 1)) / 100
+    tds = float(cfg.get("tdsPct", 0.1)) / 100
+    hold_days = int(cfg.get("holdDays", 7))
+    cutoff = datetime.now(timezone.utc).timestamp() - hold_days * 86400
+    earned = 0.0
+    for o in db.collection("orders").where("sellerEmails", "array_contains", seller_email).get():
+        od = o.to_dict()
+        if od.get("status") != "delivered":
+            continue
+        delivered_at = od.get("delivered_at") or od.get("created_at") or ""
+        try:
+            if datetime.fromisoformat(str(delivered_at).replace("Z", "+00:00")).timestamp() > cutoff:
+                continue
+        except ValueError:
+            continue
+        for it in od.get("items", []):
+            if (it.get("sellerEmail") or "").lower() != seller_email:
+                continue
+            gross = float(it.get("price", 0)) * int(it.get("quantity", 1))
+            earned += gross - gross * commission * (1 + gst_on_comm) - gross * tcs - gross * tds
+    withdrawn = 0.0
+    for p in db.collection("payout_requests").where("email", "==", seller_email).get():
+        pd = p.to_dict()
+        if pd.get("status") in ("pending", "approved", "paid", "on_hold"):
+            withdrawn += float(pd.get("amount", 0))
+    return round(max(earned - withdrawn, 0), 2)
+
 @app.route("/api/v1/seller/payouts/request", methods=["POST"])
 @seller_required
 def request_payout():
@@ -904,12 +1066,19 @@ def request_payout():
     try:
         data = request.get_json()
         if not isinstance(data, dict): return jsonify({"error": "Invalid payload"}), 400
-        amount = float(data.get("amount", 0))
-        if amount <= 0: return jsonify({"error": "Invalid payout amount"}), 400
-            
+        amount = v_float(data.get("amount", 0), 1, 10_000_000, "amount")
+        # SECURITY: previously any amount could be requested. Check against the seller's
+        # real available balance (paid, delivered, past hold window, minus pending/paid payouts).
+        available = compute_available_balance(request.seller_email)
+        if amount > available:
+            return jsonify({"error": "Amount exceeds available balance"}), 400
+        pending = db.collection("payout_requests").where("email", "==", request.seller_email).where("status", "==", "pending").limit(1).get()
+        if len(pending) > 0:
+            return jsonify({"error": "You already have a pending payout request"}), 400
+
         _, doc_ref = db.collection("payout_requests").add({
             "email": request.seller_email,
-            "brand": data.get("brand", "Unknown Brand"),
+            "brand": v_str(data.get("brand", "Unknown Brand"), 100, "brand"),
             "amount": amount,      
             "netPayable": amount,   
             "status": "pending",
@@ -994,7 +1163,10 @@ def seller_promocodes():
         if request.method == "POST":
             data = request.get_json()
             if not isinstance(data, dict): return jsonify({"error": "Invalid payload"}), 400
-            code = data.get("code", "").strip().upper()
+            code = str(data.get("code", "")).strip().upper()
+            if not PROMO_RE.match(code): return jsonify({"error": "Code must be 3-24 letters/numbers"}), 400
+            promo_type = v_choice(data.get("type", "percentage"), {"percentage", "flat"}, "type")
+            promo_value = v_float(data.get("value", 0), 1, 90 if promo_type == "percentage" else 100000, "value")
 
             existing = db.collection("promocodes").where("code", "==", code).get()
             if len(existing) > 0:
@@ -1002,15 +1174,15 @@ def seller_promocodes():
 
             promo_data = {
                 "code": code,
-                "type": data.get("type", "percentage"),
-                "value": float(data.get("value", 0)),
+                "type": promo_type,
+                "value": promo_value,
                 "creator_role": "seller",
                 "seller_email": request.seller_email,
                 "status": "pending", 
-                "usage_limit": data.get("usage_limit", "unlimited"),
-                "applicable_payment_method": data.get("payment_method", "all"), 
-                "valid_from": data.get("valid_from"),
-                "valid_until": data.get("valid_until"),
+                "usage_limit": v_choice(data.get("usage_limit", "unlimited"), {"single", "unlimited"}, "usage limit"),
+                "applicable_payment_method": v_choice(data.get("payment_method", "all"), {"all", "online", "cod"}, "payment method"),
+                "valid_from": v_str(data.get("valid_from"), 40, "valid_from") or None,
+                "valid_until": v_str(data.get("valid_until"), 40, "valid_until") or None,
                 "used_by": [],
                 "created_at": datetime.now(timezone.utc).isoformat()
             }
@@ -1029,8 +1201,10 @@ def validate_promocode():
     try:
         data = request.get_json()
         if not isinstance(data, dict): return jsonify({"error": "Invalid payload"}), 400
-        code = data.get("code", "").strip().upper()
-        customer_email = data.get("email", "").strip()
+        code = str(data.get("code", "")).strip().upper()
+        if not PROMO_RE.match(code): return jsonify({"error": "Invalid promo code"}), 404
+        user = optional_user()
+        customer_email = user["email"].lower() if user else str(data.get("email", "")).strip().lower()
 
         query = db.collection("promocodes").where("code", "==", code).limit(1).get()
         if not query:
@@ -1066,7 +1240,8 @@ def validate_promocode():
             "type": promo.get("type"),
             "value": promo.get("value"),
             "creator_role": promo.get("creator_role"),
-            "seller_email": promo.get("seller_email")
+            # SECURITY: don't reveal seller emails to the public; send a brand name instead.
+            "seller_brand": promo.get("seller_brand", "")
         }), 200
     except Exception as e:
         logger.error(f"Error validating promocode: {str(e)}", exc_info=True)
