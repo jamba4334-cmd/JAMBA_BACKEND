@@ -7,7 +7,7 @@ import logging
 from datetime import datetime, timezone
 from functools import wraps
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from dotenv import load_dotenv
 
@@ -17,7 +17,6 @@ from firebase_admin import credentials, firestore, auth as firebase_auth
 
 from fpdf import FPDF
 import io
-from flask import send_file
 
 # Load environment variables from the .env file
 load_dotenv()
@@ -330,6 +329,114 @@ def verify_payment():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/orders/<order_id>/invoice", methods=["GET"])
+def generate_invoice(order_id):
+    if db is None: 
+        return jsonify({"error": "Database unavailable"}), 503
+        
+    try:
+        # 1. Fetch Order Details
+        order_doc = db.collection("orders").document(order_id).get()
+        if not order_doc.exists:
+            return jsonify({"error": "Order not found"}), 404
+        order_data = order_doc.to_dict()
+
+        # 2. Fetch Primary Seller Details
+        seller_email = order_data.get("sellerEmails", [""])[0]
+        seller_app_doc = db.collection("authorized_sellers").document(seller_email).get()
+        seller_data = seller_app_doc.to_dict() if seller_app_doc.exists else {}
+        kyc_data = seller_data.get("kycData", {})
+
+        # 3. Tax Compliance Logic (GST vs Bill of Supply)
+        has_gst = kyc_data.get("hasGst", False)
+        document_title = "TAX INVOICE" if has_gst else "BILL OF SUPPLY"
+        gstin_display = kyc_data.get("gstNumber", "UNREGISTERED")
+
+        # 4. Generate PDF
+        pdf = FPDF()
+        pdf.add_page()
+        
+        # Header
+        pdf.set_font("Arial", 'B', 16)
+        pdf.cell(200, 10, txt=document_title, ln=True, align='C')
+        
+        pdf.set_font("Arial", size=10)
+        pdf.cell(200, 6, txt=f"Order ID: {order_data.get('jamba_order_id', order_id)}", ln=True, align='C')
+        pdf.cell(200, 6, txt=f"Date: {order_data.get('created_at', '')[:10]}", ln=True, align='C')
+        pdf.ln(10)
+
+        # Seller & Buyer Info
+        pdf.set_font("Arial", 'B', 10)
+        pdf.cell(100, 6, txt="Sold By:", ln=False)
+        pdf.cell(100, 6, txt="Billed To:", ln=True)
+        
+        pdf.set_font("Arial", size=10)
+        pdf.cell(100, 6, txt=seller_data.get("brandName", "Jambawear Artisan"), ln=False)
+        pdf.cell(100, 6, txt=order_data.get("email", "Customer"), ln=True)
+        pdf.cell(100, 6, txt=f"GSTIN / Status: {gstin_display}", ln=False)
+        
+        shipping = order_data.get("shippingAddress", {})
+        pdf.cell(100, 6, txt=f"{shipping.get('city', '')}, {shipping.get('state', '')} {shipping.get('pincode', '')}", ln=True)
+        pdf.ln(10)
+
+        # Statutory Warning for Unregistered Sellers
+        if not has_gst:
+            pdf.set_font("Arial", 'I', 9)
+            pdf.cell(200, 6, txt="* Statutory Declaration: Issuer is an unregistered artisan. No GST is collected on this supply.", ln=True)
+            pdf.ln(5)
+
+        # Items Table Header
+        pdf.set_font("Arial", 'B', 10)
+        pdf.cell(80, 8, txt="Item Description", border=1)
+        pdf.cell(30, 8, txt="Qty", border=1, align='C')
+        pdf.cell(40, 8, txt="Price", border=1, align='C')
+        pdf.cell(40, 8, txt="Total", border=1, align='C')
+        pdf.ln(8)
+
+        # Items Rows
+        pdf.set_font("Arial", size=10)
+        for item in order_data.get("items", []):
+            name = str(item.get("name", item.get("title", "Product")))[:35]
+            qty = str(item.get("quantity", 1))
+            price = f"Rs. {float(item.get('price', 0)):.2f}"
+            total = f"Rs. {float(item.get('price', 0)) * int(item.get('quantity', 1)):.2f}"
+            
+            pdf.cell(80, 8, txt=name, border=1)
+            pdf.cell(30, 8, txt=qty, border=1, align='C')
+            pdf.cell(40, 8, txt=price, border=1, align='C')
+            pdf.cell(40, 8, txt=total, border=1, align='C')
+            pdf.ln(8)
+
+        # Totals
+        pdf.ln(5)
+        pdf.set_font("Arial", 'B', 10)
+        pdf.cell(150, 8, txt="Subtotal:", align='R')
+        pdf.cell(40, 8, txt=f"Rs. {order_data.get('subtotal', 0):.2f}", align='C', ln=True)
+        
+        if has_gst:
+            pdf.cell(150, 8, txt="GST Applied:", align='R')
+            pdf.cell(40, 8, txt=f"Rs. {order_data.get('total_gst', 0):.2f}", align='C', ln=True)
+            
+        pdf.cell(150, 8, txt="Shipping:", align='R')
+        pdf.cell(40, 8, txt=f"Rs. {order_data.get('shipping_fee', 0):.2f}", align='C', ln=True)
+        
+        pdf.set_font("Arial", 'B', 12)
+        pdf.cell(150, 10, txt="Grand Total:", align='R')
+        pdf.cell(40, 10, txt=f"Rs. {order_data.get('total', 0):.2f}", align='C', ln=True)
+
+        # Output PDF to memory
+        pdf_bytes = pdf.output(dest='S').encode('latin1')
+        return send_file(
+            io.BytesIO(pdf_bytes), 
+            mimetype='application/pdf', 
+            as_attachment=True, 
+            download_name=f"Invoice_{order_id}.pdf"
+        )
+        
+    except Exception as e:
+        logger.error(f"Invoice generation failed: {e}")
+        return jsonify({"error": "Failed to generate document"}), 500
+
 # ==========================================
 # 6. ADMIN ROUTES
 # ==========================================
@@ -463,7 +570,6 @@ def remove_seller(email):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# 🔥 BRUTE-FORCE AUTH CHECK FOR STOREFRONT LAYOUTS
 @app.route("/admin/seller_profiles/<email>", methods=["GET", "PUT"])
 @admin_required
 def admin_seller_profile(email):
