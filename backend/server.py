@@ -76,8 +76,19 @@ except Exception as e:
     razorpay_client = None
 
 # ==========================================
-# 4. SECURITY MIDDLEWARE (ADMIN & SELLER)
+# 4. SECURITY MIDDLEWARE & HEADERS
 # ==========================================
+@app.after_request
+def apply_security_headers(response):
+    """Globally injects security headers to prevent XSS, Clickjacking, and MIME sniffing."""
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    # Note: If your frontend and backend are on different domains, 'self' restricts fetching. 
+    # Modify default-src or connect-src if you host API and frontend separately.
+    response.headers["Content-Security-Policy"] = "default-src 'self' https: data: 'unsafe-inline'"
+    return response
+
 def admin_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -144,14 +155,26 @@ def health():
 
 @app.route("/create-order", methods=["POST"])
 def create_order():
-    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    if db is None: 
+        return jsonify({"error": "Service temporarily unavailable."}), 503
+        
     try:
         data = request.get_json()
-        cart = data.get("cart", [])
-        customer_email = data.get("customer", "guest@jambawear.com")
+        if not data or not isinstance(data, dict):
+            return jsonify({"error": "Invalid JSON payload."}), 400
+
+        # Strict Input Validation
+        cart = data.get("cart")
+        if not isinstance(cart, list) or len(cart) == 0:
+            return jsonify({"error": "Cart cannot be empty."}), 400
+
+        customer_email = str(data.get("customer", "guest@jambawear.com")).strip()
         shipping_address = data.get("shippingAddress", {})
-        payment_method = data.get("payment_method", "Razorpay")
-        promo_code_str = data.get("promo_code", "").strip().upper()
+        if not isinstance(shipping_address, dict):
+            shipping_address = {}
+            
+        payment_method = str(data.get("payment_method", "Razorpay")).strip()
+        promo_code_str = str(data.get("promo_code", "")).strip().upper()
 
         secure_subtotal = 0
         enriched_cart = []
@@ -198,12 +221,15 @@ def create_order():
 
         for item in cart:
             item_id = str(item.get("id"))
-            quantity = int(item.get("quantity", 1))
+            try:
+                quantity = int(item.get("quantity", 1))
+            except ValueError:
+                quantity = 1
             
             doc_ref = db.collection("products").document(item_id).get()
             if not doc_ref.exists:
                 query = db.collection("products").where("item_id", "==", item_id).limit(1).get()
-                if not query: return jsonify({"error": f"Product {item_id} out of stock."}), 400
+                if not query: return jsonify({"error": f"Product out of stock."}), 400
                 product = query[0].to_dict()
             else:
                 product = doc_ref.to_dict()
@@ -299,15 +325,24 @@ def create_order():
         db.collection("orders").add(order_data)
         
         return jsonify(razorpay_order), 201
+
+    except ValueError as ve:
+        logger.warning(f"Validation Error in create_order: {ve}")
+        return jsonify({"error": "Invalid data format provided."}), 400
     except Exception as e:
-        return jsonify({"error": "Failed to process order"}), 500
+        logger.error(f"Critical error in create_order: {str(e)}", exc_info=True)
+        return jsonify({"error": "An internal server error occurred while processing your order."}), 500
 
 @app.route("/verify-payment", methods=["POST"])
 def verify_payment():
-    if db is None: return jsonify({"error": "Firebase is not connected."}), 500
-    if not razorpay_client: return jsonify({"error": "Razorpay is not configured."}), 500
+    if db is None: return jsonify({"error": "Database service unavailable."}), 503
+    if not razorpay_client: return jsonify({"error": "Payment gateway unavailable."}), 503
+    
     try:
         data = request.get_json()
+        if not data:
+            return jsonify({"error": "Invalid payload."}), 400
+            
         razorpay_order_id = data.get("razorpay_order_id")
         rose_payment_id = data.get("razorpay_payment_id")
         razorpay_signature = data.get("razorpay_signature")
@@ -326,37 +361,37 @@ def verify_payment():
                 "payment_id": rose_payment_id,
             })
         return jsonify({"status": "Payment verified and saved!"}), 200
+        
+    except razorpay.errors.SignatureVerificationError:
+        logger.warning(f"Signature verification failed for order {razorpay_order_id}")
+        return jsonify({"error": "Invalid payment signature."}), 400
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error in verify_payment: {str(e)}", exc_info=True)
+        return jsonify({"error": "An internal server error occurred."}), 500
 
 @app.route("/api/orders/<order_id>/invoice", methods=["GET"])
 def generate_invoice(order_id):
     if db is None: 
-        return jsonify({"error": "Database unavailable"}), 503
+        return jsonify({"error": "Service unavailable"}), 503
         
     try:
-        # 1. Fetch Order Details
         order_doc = db.collection("orders").document(order_id).get()
         if not order_doc.exists:
             return jsonify({"error": "Order not found"}), 404
         order_data = order_doc.to_dict()
 
-        # 2. Fetch Primary Seller Details
         seller_email = order_data.get("sellerEmails", [""])[0]
         seller_app_doc = db.collection("authorized_sellers").document(seller_email).get()
         seller_data = seller_app_doc.to_dict() if seller_app_doc.exists else {}
         kyc_data = seller_data.get("kycData", {})
 
-        # 3. Tax Compliance Logic (GST vs Bill of Supply)
         has_gst = kyc_data.get("hasGst", False)
         document_title = "TAX INVOICE" if has_gst else "BILL OF SUPPLY"
         gstin_display = kyc_data.get("gstNumber", "UNREGISTERED")
 
-        # 4. Generate PDF
         pdf = FPDF()
         pdf.add_page()
         
-        # Header
         pdf.set_font("Arial", 'B', 16)
         pdf.cell(200, 10, txt=document_title, ln=True, align='C')
         
@@ -365,7 +400,6 @@ def generate_invoice(order_id):
         pdf.cell(200, 6, txt=f"Date: {order_data.get('created_at', '')[:10]}", ln=True, align='C')
         pdf.ln(10)
 
-        # Seller & Buyer Info
         pdf.set_font("Arial", 'B', 10)
         pdf.cell(100, 6, txt="Sold By:", ln=False)
         pdf.cell(100, 6, txt="Billed To:", ln=True)
@@ -379,13 +413,11 @@ def generate_invoice(order_id):
         pdf.cell(100, 6, txt=f"{shipping.get('city', '')}, {shipping.get('state', '')} {shipping.get('pincode', '')}", ln=True)
         pdf.ln(10)
 
-        # Statutory Warning for Unregistered Sellers
         if not has_gst:
             pdf.set_font("Arial", 'I', 9)
             pdf.cell(200, 6, txt="* Statutory Declaration: Issuer is an unregistered artisan. No GST is collected on this supply.", ln=True)
             pdf.ln(5)
 
-        # Items Table Header
         pdf.set_font("Arial", 'B', 10)
         pdf.cell(80, 8, txt="Item Description", border=1)
         pdf.cell(30, 8, txt="Qty", border=1, align='C')
@@ -393,7 +425,6 @@ def generate_invoice(order_id):
         pdf.cell(40, 8, txt="Total", border=1, align='C')
         pdf.ln(8)
 
-        # Items Rows
         pdf.set_font("Arial", size=10)
         for item in order_data.get("items", []):
             name = str(item.get("name", item.get("title", "Product")))[:35]
@@ -407,7 +438,6 @@ def generate_invoice(order_id):
             pdf.cell(40, 8, txt=total, border=1, align='C')
             pdf.ln(8)
 
-        # Totals
         pdf.ln(5)
         pdf.set_font("Arial", 'B', 10)
         pdf.cell(150, 8, txt="Subtotal:", align='R')
@@ -424,7 +454,6 @@ def generate_invoice(order_id):
         pdf.cell(150, 10, txt="Grand Total:", align='R')
         pdf.cell(40, 10, txt=f"Rs. {order_data.get('total', 0):.2f}", align='C', ln=True)
 
-        # Output PDF to memory
         pdf_bytes = pdf.output(dest='S').encode('latin1')
         return send_file(
             io.BytesIO(pdf_bytes), 
@@ -434,7 +463,7 @@ def generate_invoice(order_id):
         )
         
     except Exception as e:
-        logger.error(f"Invoice generation failed: {e}")
+        logger.error(f"Invoice generation failed for order {order_id}: {str(e)}", exc_info=True)
         return jsonify({"error": "Failed to generate document"}), 500
 
 # ==========================================
@@ -451,16 +480,19 @@ def admin_products():
             docs = db.collection("products").order_by("created_at", direction=firestore.Query.DESCENDING).limit(limit).get()
             for doc in docs: products.append({**doc.to_dict(), "docId": doc.id})
             return jsonify(products), 200
-        except Exception as e: 
-            return jsonify({"error": str(e)}), 500
+        except Exception as e:
+            logger.error(f"Error fetching admin products: {str(e)}", exc_info=True)
+            return jsonify({"error": "Internal server error"}), 500
     if request.method == "POST":
         try:
             data = request.get_json()
+            if not isinstance(data, dict): return jsonify({"error": "Invalid payload"}), 400
             data["created_at"] = datetime.now(timezone.utc).isoformat()
             _, doc_ref = db.collection("products").add(data)
             return jsonify({"status": "success", "id": doc_ref.id}), 201
-        except Exception as e: 
-            return jsonify({"error": str(e)}), 500
+        except Exception as e:
+            logger.error(f"Error creating admin product: {str(e)}", exc_info=True)
+            return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/admin/products/<doc_id>", methods=["PUT", "DELETE"])
 @admin_required
@@ -469,13 +501,16 @@ def admin_product_detail(doc_id):
     try:
         doc_ref = db.collection("products").document(doc_id)
         if request.method == "PUT":
-            doc_ref.update(request.get_json())
+            data = request.get_json()
+            if not isinstance(data, dict): return jsonify({"error": "Invalid payload"}), 400
+            doc_ref.update(data)
             return jsonify({"status": "success"}), 200
         if request.method == "DELETE":
             doc_ref.delete()
             return jsonify({"status": "success"}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error updating admin product {doc_id}: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/admin/orders", methods=["GET"])
 @admin_required
@@ -487,18 +522,22 @@ def admin_orders():
         docs = db.collection("orders").order_by("created_at", direction=firestore.Query.DESCENDING).limit(limit).get()
         for doc in docs: orders.append({**doc.to_dict(), "id": doc.id})
         return jsonify(orders), 200
-    except Exception as e: 
-        return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        logger.error(f"Error fetching admin orders: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/admin/orders/<order_id>", methods=["PUT"])
 @admin_required
 def update_order(order_id):
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     try:
-        db.collection("orders").document(order_id).update(request.get_json())
+        data = request.get_json()
+        if not isinstance(data, dict): return jsonify({"error": "Invalid payload"}), 400
+        db.collection("orders").document(order_id).update(data)
         return jsonify({"status": "success"}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error updating admin order {order_id}: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/admin/orders/<order_id>/force-clear", methods=["POST"])
 @admin_required
@@ -508,7 +547,8 @@ def force_clear_order(order_id):
         db.collection("orders").document(order_id).update({"status": "settled_override"})
         return jsonify({"status": "success", "message": "Escrow released manually."}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error clearing admin order {order_id}: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/admin/customers", methods=["GET"])
 @admin_required
@@ -519,7 +559,8 @@ def admin_customers():
         customers = [{**doc.to_dict(), "id": doc.id} for doc in db.collection("users").limit(limit).get()]
         return jsonify(customers), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error fetching admin customers: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/admin/settings/<doc_id>", methods=["GET", "PUT"])
 @admin_required
@@ -532,11 +573,13 @@ def admin_settings(doc_id):
             return jsonify({"tribes": []} if doc_id == "tribe_categories" else {}), 200
         if request.method == "PUT":
             data = request.get_json()
+            if not isinstance(data, dict): return jsonify({"error": "Invalid payload"}), 400
             if doc_id == "tribe_categories": data["last_updated"] = datetime.now(timezone.utc).isoformat()
             db.collection("settings").document(doc_id).set(data, merge=True)
             return jsonify({"status": "Settings updated"}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error in admin settings {doc_id}: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/admin/sellers", methods=["GET", "POST"])
 @admin_required
@@ -553,13 +596,16 @@ def admin_sellers():
             return jsonify(sellers), 200
             
         if request.method == "POST":
-            email = request.get_json().get("email")
+            data = request.get_json()
+            if not isinstance(data, dict): return jsonify({"error": "Invalid payload"}), 400
+            email = data.get("email")
             db.collection("authorized_sellers").document(email).set({
                 "email": email, "addedAt": datetime.now(timezone.utc).isoformat(), "addedBy": ALLOWED_ADMIN_EMAIL
             })
             return jsonify({"status": "Seller authorized"}), 201
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error in admin sellers: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/admin/sellers/<email>", methods=["DELETE"])
 @admin_required
@@ -568,7 +614,8 @@ def remove_seller(email):
         db.collection("authorized_sellers").document(email).delete()
         return jsonify({"status": "Seller removed"}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error removing seller {email}: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/admin/seller_profiles/<email>", methods=["GET", "PUT"])
 @admin_required
@@ -591,9 +638,9 @@ def admin_seller_profile(email):
         data["updated_at"] = datetime.now(timezone.utc).isoformat()
         profile_ref.set(data, merge=True)
         return jsonify({"status": "Profile updated"}), 200
-    except Exception:
-        logger.exception("Could not read or save seller storefront.")
-        return jsonify({"error": "Could not save seller storefront"}), 500
+    except Exception as e:
+        logger.error(f"Could not read or save seller storefront for {email}: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 # ==========================================
 # 7. ADMIN FINANCE & LEDGERS
@@ -615,7 +662,8 @@ def admin_payouts():
         payouts = [{**doc.to_dict(), "id": doc.id} for doc in query.get()]
         return jsonify(payouts), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error in admin payouts: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/admin/finance/customer-payments", methods=["GET"])
 @admin_required
@@ -639,7 +687,8 @@ def admin_customer_payments():
             })
         return jsonify(payments), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error in customer payments: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/admin/finance/kpis", methods=["GET"])
 @admin_required
@@ -662,7 +711,8 @@ def admin_finance_kpis():
             "totalGST": round(jamba_revenue * 0.18, 2)
         }), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error fetching finance KPIs: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/admin/transactions", methods=["GET"])
 @admin_required
@@ -673,7 +723,8 @@ def admin_transactions():
         docs = db.collection("transactions").order_by("created_at", direction=firestore.Query.DESCENDING).limit(limit).get()
         return jsonify([{**doc.to_dict(), "id": doc.id} for doc in docs]), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error fetching transactions: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/admin/finance/adjust", methods=["POST"])
 @admin_required
@@ -681,6 +732,7 @@ def inject_financial_adjustment():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     try:
         data = request.get_json()
+        if not isinstance(data, dict): return jsonify({"error": "Invalid payload"}), 400
         brand = data.get("brand", "Global Correction")
         amount = float(data.get("amount", 0))
         db.collection("transactions").add({
@@ -694,7 +746,8 @@ def inject_financial_adjustment():
         })
         return jsonify({"status": "success"}), 201
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error injecting adjustment: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/admin/payouts/<payout_id>", methods=["PUT"])
 @admin_required
@@ -702,6 +755,7 @@ def update_payout(payout_id):
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     try:
         data = request.get_json()
+        if not isinstance(data, dict): return jsonify({"error": "Invalid payload"}), 400
         payout_ref = db.collection("payout_requests").document(payout_id)
         payout_doc = payout_ref.get()
         
@@ -723,7 +777,8 @@ def update_payout(payout_id):
             })
         return jsonify({"status": "Payout updated and ledger recorded"}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error updating payout {payout_id}: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 # ==========================================
 # 8. SELLER FINANCE & PAYOUT ROUTES
@@ -826,7 +881,7 @@ def get_isolated_seller_data():
             "sales_ledger": isolated_sales_ledger
         }), 200
     except Exception as e:
-        logger.error(f"Pipeline error: {e}")
+        logger.error(f"Pipeline error for seller {request.seller_email}: {str(e)}", exc_info=True)
         return jsonify({"error": "Failed to securely route financial data"}), 500
 
 @app.route("/api/v1/seller/payouts/history", methods=["GET"])
@@ -839,8 +894,8 @@ def get_payout_history():
         history.sort(key=lambda x: x.get("created_at", ""), reverse=True)
         return jsonify(history), 200
     except Exception as e: 
-        logger.error(f"History error: {e}")
-        return jsonify({"error": "Failed to load history"}), 500
+        logger.error(f"History error for seller {request.seller_email}: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/api/v1/seller/payouts/request", methods=["POST"])
 @seller_required
@@ -848,6 +903,7 @@ def request_payout():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     try:
         data = request.get_json()
+        if not isinstance(data, dict): return jsonify({"error": "Invalid payload"}), 400
         amount = float(data.get("amount", 0))
         if amount <= 0: return jsonify({"error": "Invalid payout amount"}), 400
             
@@ -862,8 +918,8 @@ def request_payout():
         })
         return jsonify({"status": "success", "id": doc_ref.id}), 201
     except Exception as e: 
-        logger.error(f"Request error: {e}")
-        return jsonify({"error": "Failed to process request"}), 500
+        logger.error(f"Payout request error: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 # ==========================================
 # 9. PROMO CODE ENGINE (ADMIN & SELLER)
@@ -879,6 +935,7 @@ def admin_promocodes():
             
         if request.method == "POST":
             data = request.get_json()
+            if not isinstance(data, dict): return jsonify({"error": "Invalid payload"}), 400
             code = data.get("code", "").strip().upper()
             
             existing = db.collection("promocodes").where("code", "==", code).get()
@@ -902,7 +959,8 @@ def admin_promocodes():
             _, doc_ref = db.collection("promocodes").add(promo_data)
             return jsonify({"status": "success", "id": doc_ref.id}), 201
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error handling admin promocodes: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/admin/promocodes/<doc_id>", methods=["PUT", "DELETE"])
 @admin_required
@@ -912,13 +970,15 @@ def manage_promocode(doc_id):
         doc_ref = db.collection("promocodes").document(doc_id)
         if request.method == "PUT":
             update_data = request.get_json()
+            if not isinstance(update_data, dict): return jsonify({"error": "Invalid payload"}), 400
             doc_ref.update({"status": update_data.get("status", "pending")})
             return jsonify({"status": "success"}), 200
         if request.method == "DELETE":
             doc_ref.delete()
             return jsonify({"status": "success"}), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error managing promocode {doc_id}: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/api/v1/seller/promocodes", methods=["GET", "POST"])
 @seller_required
@@ -933,6 +993,7 @@ def seller_promocodes():
 
         if request.method == "POST":
             data = request.get_json()
+            if not isinstance(data, dict): return jsonify({"error": "Invalid payload"}), 400
             code = data.get("code", "").strip().upper()
 
             existing = db.collection("promocodes").where("code", "==", code).get()
@@ -956,8 +1017,8 @@ def seller_promocodes():
             _, doc_ref = db.collection("promocodes").add(promo_data)
             return jsonify({"status": "success", "id": doc_ref.id}), 201
     except Exception as e:
-        logger.error(f"Seller Promo Error: {e}")
-        return jsonify({"error": "Failed to process promo code"}), 500
+        logger.error(f"Seller Promo Error: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 # ==========================================
 # 10. CUSTOMER CHECKOUT PROMO VALIDATION
@@ -967,6 +1028,7 @@ def validate_promocode():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     try:
         data = request.get_json()
+        if not isinstance(data, dict): return jsonify({"error": "Invalid payload"}), 400
         code = data.get("code", "").strip().upper()
         customer_email = data.get("email", "").strip()
 
@@ -1007,7 +1069,8 @@ def validate_promocode():
             "seller_email": promo.get("seller_email")
         }), 200
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Error validating promocode: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 # ==========================================
 # 11. RUN THE SERVER
