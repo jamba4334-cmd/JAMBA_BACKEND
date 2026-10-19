@@ -156,13 +156,9 @@ except Exception as e:
 # ==========================================
 @app.after_request
 def apply_security_headers(response):
-    """Globally injects security headers to prevent XSS, Clickjacking, and MIME sniffing."""
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    # Note: If your frontend and backend are on different domains, 'self' restricts fetching. 
-    # Modify default-src or connect-src if you host API and frontend separately.
-    # API returns JSON/PDF only, so lock CSP down completely.
     response.headers["Content-Security-Policy"] = "default-src 'none'; frame-ancestors 'none'"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
@@ -173,7 +169,6 @@ def apply_security_headers(response):
     return response
 
 def _verify_bearer():
-    """Returns decoded Firebase token or None. Rejects revoked tokens and unverified emails."""
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
         return None
@@ -184,8 +179,6 @@ def _verify_bearer():
         decoded = firebase_auth.verify_id_token(token, check_revoked=True)
     except Exception:
         return None
-    # SECURITY: an attacker can register email/password with someone else's address.
-    # Only trust emails Firebase has verified (Google sign-in is always verified).
     if not decoded.get("email") or decoded.get("email_verified") is not True:
         return None
     return decoded
@@ -225,7 +218,6 @@ def seller_required(f):
     return decorated_function
 
 def optional_user():
-    """Decoded token for customers (may be None for guest checkout)."""
     return _verify_bearer()
 
 # ==========================================
@@ -245,15 +237,13 @@ def create_order():
         if not data or not isinstance(data, dict):
             return jsonify({"error": "Invalid JSON payload."}), 400
 
-        # Strict Input Validation
         cart = data.get("cart")
         if not isinstance(cart, list) or len(cart) == 0:
             return jsonify({"error": "Cart cannot be empty."}), 400
 
         if len(cart) > 50:
             return jsonify({"error": "Too many items in cart."}), 400
-        # SECURITY: identity comes from the verified token, not the request body,
-        # so a user cannot spend someone else's single-use promo.
+
         user = optional_user()
         customer_email = user["email"].lower() if user else v_email(data.get("customer"), "customer email")
         customer_uid = user["uid"] if user else None
@@ -264,19 +254,29 @@ def create_order():
                             ["name", "phone", "line1", "line2", "city", "state", "pincode", "landmark"]}
             
         payment_method = "COD" if str(data.get("payment_method", "Razorpay")).strip().upper() == "COD" else "Razorpay"
-        promo_code_str = str(data.get("promo_code", "")).strip().upper()
+        promo_code_str = str(data.get("promo_code", data.get("promo_used", ""))).strip().upper()
 
-        secure_subtotal = 0
-        enriched_cart = []
-        seller_emails_set = set()
+        # 1. FETCH DYNAMIC FINANCIAL SETTINGS
+        config_doc = db.collection("settings").document("financial_settings").get()
+        config = config_doc.to_dict() if config_doc.exists else {}
+        
+        free_shipping_min = float(config.get("shippingFreeThreshold", 1999.0))
+        default_shipping_fee = float(config.get("defaultShippingFee", 149.0))
+        cod_convenience_fee = float(config.get("codConvenienceFee", 39.0))
 
-        # 1. VERIFY PROMO CODE
+        raw_brackets = config.get("gstBrackets", [
+            {"maxLimit": 2500, "rate": 5.0}, 
+            {"maxLimit": 999999, "rate": 18.0}
+        ])
+        gst_brackets = sorted(raw_brackets, key=lambda x: float(x.get("maxLimit", 999999)))
+
+        # 2. VERIFY PROMO CODE
         promo_data = None
+        promo_doc_id = None
         if promo_code_str:
             promo_query = db.collection("promocodes").where("code", "==", promo_code_str).where("status", "==", "active").limit(1).get()
             if promo_query:
                 temp_promo = promo_query[0].to_dict()
-                
                 now = datetime.now(timezone.utc).isoformat()
                 
                 is_valid_time = True
@@ -293,27 +293,29 @@ def create_order():
                     if now > promo_end: is_valid_time = False
                 
                 is_valid_usage = True
-                if temp_promo.get("usage_limit") == "single" and customer_email in temp_promo.get("used_by", []): is_valid_usage = False
+                if temp_promo.get("usage_limit") == "single" and customer_email in temp_promo.get("used_by", []): 
+                    is_valid_usage = False
                 
                 promo_payment_method = temp_promo.get("applicable_payment_method", "all")
-                if promo_payment_method == "online" and payment_method.upper() == "COD":
+                if promo_payment_method == "online" and payment_method == "COD":
                     return jsonify({"error": "This promo code is strictly for Prepaid Online Orders."}), 400
-                if promo_payment_method == "cod" and payment_method.upper() != "COD":
+                if promo_payment_method == "cod" and payment_method != "COD":
                     return jsonify({"error": "This promo code is only valid for Cash on Delivery orders."}), 400
 
                 if is_valid_time and is_valid_usage:
                     promo_data = temp_promo
                     promo_doc_id = promo_query[0].id
 
-        # 2. PROCESS CART
-        total_discount = 0
+        # 3. PROCESS CART & SECURE LIVE RECALCULATION
+        secure_subtotal = 0
         seller_eligible_subtotal = 0
+        enriched_cart = []
+        seller_emails_set = set()
 
         for item in cart:
             if not isinstance(item, dict):
                 return jsonify({"error": "Invalid cart item."}), 400
-            item_id = v_doc_id(item.get("id"), "product id")
-            # SECURITY: negative/huge quantities previously produced negative totals.
+            item_id = v_doc_id(item.get("id") or item.get("item_id"), "product id")
             quantity = v_int(item.get("quantity", 1), 1, 20, "quantity")
             
             doc_ref = db.collection("products").document(item_id).get()
@@ -324,60 +326,80 @@ def create_order():
             else:
                 product = doc_ref.to_dict()
 
+            # Security: Out-of-Stock Preventer
+            available_stock = int(product.get("stock", 0) or product.get("available_stock", 0))
+            if available_stock < quantity and not product.get("made_to_order", False):
+                return jsonify({"error": f"Not enough stock for {product.get('title', product.get('name'))}. Only {available_stock} left."}), 400
+
             real_price = float(product.get("selling_price", 0))
+            
+            # Match live price against dynamic GST brackets
+            effective_gst_rate = 18.0 
+            for bracket in gst_brackets:
+                if real_price <= float(bracket.get("maxLimit", 999999)):
+                    effective_gst_rate = float(bracket.get("rate", 18.0))
+                    break
+
             item_total = real_price * quantity
             secure_subtotal += item_total
             
             seller_email = product.get("sellerEmail", "")
             if seller_email: seller_emails_set.add(seller_email)
             
-            is_returnable = product.get("isReturnable", True)
-
             if promo_data and promo_data.get("creator_role") == "seller":
                 if promo_data.get("seller_email") == seller_email:
                     seller_eligible_subtotal += item_total
 
-            item = {
+            item_enriched = {
                 "id": item_id,
                 "quantity": quantity,
                 "size": v_str(item.get("size", ""), 20, "size"),
                 "color": v_str(item.get("color", ""), 40, "color"),
-                "name": product.get("name", ""),
+                "name": product.get("name", product.get("title", "")),
                 "price": real_price,
-                "brandName": product.get("brandName", ""),
+                "brandName": product.get("brandName", "JAMBA WEAR"),
                 "sellerName": product.get("sellerName", ""),
                 "sellerEmail": seller_email,
-                "isReturnable": is_returnable
+                "isReturnable": product.get("isReturnable", True),
+                "hsn": product.get("hsn", "6204"),
+                "applied_gst_rate": effective_gst_rate
             }
-            enriched_cart.append(item)
+            enriched_cart.append(item_enriched)
 
-        # 3. CALCULATE MATH
+        # 4. CALCULATE MATH & DYNAMIC TAX EXTRACTION
+        total_discount = 0.0
         if promo_data:
             discount_value = float(promo_data.get("value", 0))
-            
             if promo_data.get("creator_role") == "admin":
                 if promo_data.get("type") == "percentage":
-                    total_discount = secure_subtotal * (discount_value / 100)
+                    total_discount = secure_subtotal * (discount_value / 100.0)
                 else:
                     total_discount = min(discount_value, secure_subtotal)
-            
             elif promo_data.get("creator_role") == "seller":
                 if promo_data.get("type") == "percentage":
-                    total_discount = seller_eligible_subtotal * (discount_value / 100)
+                    total_discount = seller_eligible_subtotal * (discount_value / 100.0)
                 else:
                     total_discount = min(discount_value, seller_eligible_subtotal)
 
         taxable_value = secure_subtotal - total_discount
         
-        if taxable_value <= 2500:
-            total_gst = taxable_value * 0.05
-        else:
-            total_gst = taxable_value * 0.18
+        # Calculate exactly how much GST was embedded inside the item prices (Inclusive Tax Model)
+        total_gst = 0.0
+        for item in enriched_cart:
+            item_ratio = (item["price"] * item["quantity"]) / secure_subtotal if secure_subtotal > 0 else 0
+            item_net = (item["price"] * item["quantity"]) - (total_discount * item_ratio)
+            # GST = Price - (Price / (1 + Rate))
+            item_tax = item_net - (item_net / (1 + (item["applied_gst_rate"] / 100.0)))
+            total_gst += item_tax
 
-        shipping_fee = 149 if secure_subtotal < 1999 else 0
-        final_total = max(taxable_value + shipping_fee, 0)
+        calculated_shipping = 0.0 if taxable_value >= free_shipping_min else default_shipping_fee
+        extra_cod = cod_convenience_fee if payment_method == "COD" else 0.0
+
+        final_total = max(taxable_value + calculated_shipping + extra_cod, 0)
+        
         if final_total <= 0 or final_total > 1_000_000:
             return jsonify({"error": "Invalid order total."}), 400
+            
         unique_jamba_id = "JB" + datetime.now(timezone.utc).strftime("%y%m%d") + uuid.uuid4().hex[:6].upper()
 
         order_data = {
@@ -391,8 +413,9 @@ def create_order():
             "promo_creator_role": promo_data.get("creator_role") if promo_data else None,
             "promo_seller_email": promo_data.get("seller_email") if promo_data else None,
             "taxable_value": taxable_value,
-            "total_gst": total_gst,
-            "shipping_fee": shipping_fee,
+            "total_gst": round(total_gst, 2),
+            "shipping_fee": calculated_shipping,
+            "cod_fee": extra_cod,
             "total": final_total,
             "status": "pending",
             "payment_method": payment_method,
@@ -401,11 +424,13 @@ def create_order():
             "sellerEmails": list(seller_emails_set)
         }
 
+        # Handle Single-Use Promo Markoff
         if total_discount > 0 and promo_data and promo_data.get("usage_limit") == "single":
             db.collection("promocodes").document(promo_doc_id).update({
                 "used_by": firestore.ArrayUnion([customer_email])
             })
 
+        # 5. EXECUTE ORDER CREATION
         if payment_method == "COD":
             order_data["status"] = "processing"
             order_data["order_id"] = f"cod_{int(datetime.now().timestamp())}"
@@ -419,6 +444,7 @@ def create_order():
             "currency": "INR",
             "receipt": f"rcpt_{int(datetime.now().timestamp())}"
         })
+        
         order_data["razorpay_order_id"] = razorpay_order["id"]
         db.collection("orders").add(order_data)
         
@@ -433,7 +459,7 @@ def create_order():
 
 @app.route("/verify-payment", methods=["POST"])
 def verify_payment():
-    if db is None: return jsonify({"error": "Database service unavailable."}), 503
+    if db is None: return jsonify({"error": "Database unavailable."}), 503
     if not razorpay_client: return jsonify({"error": "Payment gateway unavailable."}), 503
     
     try:
@@ -476,7 +502,6 @@ def generate_invoice(order_id):
         
     try:
         order_id = v_doc_id(order_id, "order id")
-        # SECURITY: invoices contain name, address and phone - require the owner (or an admin).
         user = optional_user()
         if not user:
             return jsonify({"error": "Unauthorized"}), 401
@@ -924,9 +949,9 @@ def get_isolated_seller_data():
         
         commission_percent = float(config.get("platformCommission", 30.0))
         tcs_percent = float(config.get("tcsRate", 1.0))
-        gst_threshold = float(config.get("gstThreshold", 2500.0))
-        gst_lower_rate = float(config.get("gstLowerRate", 5.0))
-        gst_upper_rate = float(config.get("gstUpperRate", 18.0))
+        
+        raw_brackets = config.get("gstBrackets", [{"maxLimit": 2500, "rate": 5.0}, {"maxLimit": 999999, "rate": 18.0}])
+        gst_brackets = sorted(raw_brackets, key=lambda x: float(x.get("maxLimit", 999999)))
         
         orders_query = db.collection("orders").where("sellerEmails", "array_contains", current_seller_email).get()
         
@@ -958,14 +983,15 @@ def get_isolated_seller_data():
                     item_discount = order_discount * (gross_item_revenue / seller_gross_total)
                     
                 discounted_item_revenue = gross_item_revenue - item_discount
-                
                 jamba_fee = discounted_item_revenue * (commission_percent / 100.0)
                 commission_gst = jamba_fee * 0.18
                 
-                if discounted_item_revenue <= gst_threshold:
-                    product_gst_percent = gst_lower_rate
-                else:
-                    product_gst_percent = gst_upper_rate
+                # Match live price against dynamic GST brackets for Seller Dashboard
+                product_gst_percent = 18.0
+                for bracket in gst_brackets:
+                    if item_price <= float(bracket.get("maxLimit", 999999)):
+                        product_gst_percent = float(bracket.get("rate", 18.0))
+                        break
                     
                 net_product_value = discounted_item_revenue / (1 + (product_gst_percent / 100.0))
                 tcs_amount = net_product_value * (tcs_percent / 100.0)
@@ -1067,8 +1093,6 @@ def request_payout():
         data = request.get_json()
         if not isinstance(data, dict): return jsonify({"error": "Invalid payload"}), 400
         amount = v_float(data.get("amount", 0), 1, 10_000_000, "amount")
-        # SECURITY: previously any amount could be requested. Check against the seller's
-        # real available balance (paid, delivered, past hold window, minus pending/paid payouts).
         available = compute_available_balance(request.seller_email)
         if amount > available:
             return jsonify({"error": "Amount exceeds available balance"}), 400
@@ -1240,7 +1264,6 @@ def validate_promocode():
             "type": promo.get("type"),
             "value": promo.get("value"),
             "creator_role": promo.get("creator_role"),
-            # SECURITY: don't reveal seller emails to the public; send a brand name instead.
             "seller_brand": promo.get("seller_brand", "")
         }), 200
     except Exception as e:
