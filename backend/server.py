@@ -165,7 +165,7 @@ def apply_security_headers(response):
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     response.headers["Cross-Origin-Resource-Policy"] = "same-site"
-    if request.path.startswith(("/admin", "/api/v1/seller")) or request.headers.get("Authorization"):
+    if request.path.startswith(("/admin", "/api/v1/seller", "/api/v1/customer")) or request.headers.get("Authorization"):
         response.headers["Cache-Control"] = "no-store"
     response.headers.pop("Server", None)
     return response
@@ -212,7 +212,7 @@ def seller_required(f):
 def optional_user(): return _verify_bearer()
 
 # ==========================================
-# 5. PUBLIC ROUTES (Customer Facing)
+# 5. PUBLIC STOREFRONT & CHECKOUT ROUTES
 # ==========================================
 @app.route("/health", methods=["GET"])
 @limiter.exempt
@@ -265,7 +265,6 @@ def get_public_storefronts():
         logger.error(f"Error fetching storefronts: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
-
 @app.route('/api/v1/public/storefront/<handle>', methods=['GET'])
 @limiter.limit("30 per minute")
 def get_single_storefront(handle):
@@ -288,7 +287,6 @@ def get_single_storefront(handle):
     except Exception as e:
         logger.error(f"Error fetching storefront {handle}: {str(e)}")
         return jsonify({"error": "Internal server error"}), 500
-
 
 @app.route("/create-order", methods=["POST"])
 @limiter.limit("5 per minute")
@@ -371,7 +369,7 @@ def create_order():
 
             available_stock = int(product.get("stock", 0) or product.get("available_stock", 0))
             if available_stock < quantity and not product.get("made_to_order", False):
-                return jsonify({"error": f"Not enough stock for {product.get('name')}. Only {available_stock} left."}), 400
+                return jsonify({"error": f"Not enough stock for {product.get('name', product.get('title', 'Product'))}. Only {available_stock} left."}), 400
 
             real_price = float(product.get("selling_price", 0))
             effective_gst_rate = 18.0 
@@ -388,7 +386,6 @@ def create_order():
             if promo_data and promo_data.get("creator_role") == "seller" and promo_data.get("seller_email") == seller_email:
                 seller_eligible_subtotal += item_total
 
-            # 🔥 FIX: Extract the primary image safely
             product_images = product.get("images", [])
             primary_image = product_images[0] if isinstance(product_images, list) and len(product_images) > 0 else ""
 
@@ -405,7 +402,7 @@ def create_order():
                 "isReturnable": product.get("isReturnable", True), 
                 "hsn": product.get("hsn", "6204"),
                 "applied_gst_rate": effective_gst_rate,
-                "image": primary_image  # <-- Fixed image mapping
+                "image": primary_image
             })
 
         total_discount = 0.0
@@ -1002,7 +999,7 @@ def compute_available_balance(seller_email):
 
         for it in seller_items:
             item_price = float(it.get("price", 0))
-            item_qty = int(it.get("quantity", 1))
+            item_qty = int(item.get("quantity", 1))
             gross_item_revenue = item_price * item_qty
             
             item_discount = order_discount * (gross_item_revenue / seller_gross_total) if (seller_bears_discount and seller_gross_total > 0) else 0
@@ -1159,6 +1156,164 @@ def validate_promocode():
 
         return jsonify({"status": "success", "type": promo.get("type"), "value": promo.get("value"), "creator_role": promo.get("creator_role"), "seller_brand": promo.get("seller_brand", "")}), 200
     except Exception as e: return jsonify({"error": "Internal server error"}), 500
+
+# ==========================================
+# 10. CUSTOMER DASHBOARD & ACCOUNT APIS
+# ==========================================
+@app.route("/api/v1/customer/orders", methods=["GET"])
+def get_customer_orders():
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    
+    user = _verify_bearer()
+    if not user: return jsonify({"error": "Unauthorized"}), 401
+    
+    try:
+        user_email = user.get("email", "").lower()
+        user_uid = user.get("uid", "")
+        
+        orders_by_uid = db.collection("orders").where("userId", "==", user_uid).get()
+        orders_by_email = db.collection("orders").where("email", "==", user_email).get()
+        
+        orders_map = {}
+        for doc in list(orders_by_uid) + list(orders_by_email):
+            data = doc.to_dict()
+            data["id"] = doc.id
+            orders_map[doc.id] = data
+            
+        customer_orders = list(orders_map.values())
+        customer_orders.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        
+        return jsonify(customer_orders), 200
+    except Exception as e:
+        logger.error(f"Error fetching customer orders: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route("/api/v1/public/config/<doc_id>", methods=["GET"])
+@limiter.limit("60 per minute")
+def get_public_config(doc_id):
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    doc_snap = db.collection("settings").document(v_doc_id(doc_id, "doc_id")).get()
+    return jsonify(doc_snap.to_dict() if doc_snap.exists else {}), 200
+
+@app.route("/api/v1/public/products/<item_id>", methods=["GET"])
+@limiter.limit("60 per minute")
+def get_public_product(item_id):
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    clean_id = v_doc_id(item_id, "item_id")
+    q = db.collection("products").where("item_id", "==", clean_id).limit(1).get()
+    if not q:
+        doc_snap = db.collection("products").document(clean_id).get()
+        if not doc_snap.exists: return jsonify({"error": "Not found"}), 404
+        data = doc_snap.to_dict()
+        data["id"] = doc_snap.id
+        return jsonify(data), 200
+    data = q[0].to_dict()
+    data["id"] = q[0].id
+    return jsonify(data), 200
+
+@app.route("/api/v1/public/recommendations/<category>", methods=["GET"])
+def get_recommendations(category):
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    q = db.collection("products").where("category", "==", v_str(category, 100, "category")).limit(10).get()
+    return jsonify([{**d.to_dict(), "id": d.id} for d in q if not d.to_dict().get("isHidden")]), 200
+
+@app.route("/api/v1/public/reviews/<product_id>", methods=["GET"])
+def get_public_reviews(product_id):
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    q = db.collection("reviews").where("productId", "==", v_doc_id(product_id, "product_id")).get()
+    return jsonify([{**d.to_dict(), "id": d.id} for d in q]), 200
+
+@app.route("/api/v1/customer/profile", methods=["GET", "POST"])
+def manage_customer_profile():
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    user = _verify_bearer()
+    if not user: return jsonify({"error": "Unauthorized"}), 401
+    
+    doc_ref = db.collection("users").document(user["uid"])
+    if request.method == "GET":
+        doc_snap = doc_ref.get()
+        if doc_snap.exists and (doc_snap.to_dict().get("name") or doc_snap.to_dict().get("ownerName")):
+            return jsonify({"exists": True, "profile": doc_snap.to_dict()}), 200
+        return jsonify({"exists": False}), 200
+        
+    data = request.get_json()
+    payload = {
+        "name": v_str(data.get("name", user.get("name", "JAMBA Member")), 100, "name"),
+        "ownerName": v_str(data.get("name", user.get("name", "JAMBA Member")), 100, "name"),
+        "email": user.get("email", ""),
+        "role": "customer",
+        "uid": user["uid"],
+        "createdAt": data.get("createdAt", datetime.now(timezone.utc).isoformat())
+    }
+    if data.get("phone"): payload["phone"] = v_str(data["phone"], 20, "phone")
+    doc_ref.set(payload, merge=True)
+    return jsonify({"status": "success"}), 200
+
+@app.route("/api/v1/customer/wishlist", methods=["GET", "POST", "DELETE"])
+def manage_wishlist():
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    user = _verify_bearer()
+    if not user: return jsonify({"error": "Unauthorized"}), 401
+    
+    if request.method == "GET":
+        q = db.collection("users").document(user["uid"]).collection("wishlist").get()
+        items = []
+        for doc_snap in q:
+            pid = doc_snap.to_dict().get("productId")
+            p_snap = db.collection("products").document(pid).get()
+            if p_snap.exists: items.append({**p_snap.to_dict(), "id": p_snap.id})
+        return jsonify(items), 200
+        
+    data = request.get_json()
+    product_id = v_doc_id(data.get("productId"), "product_id")
+    wishlist_ref = db.collection("users").document(user["uid"]).collection("wishlist").document(product_id)
+    
+    if request.method == "POST":
+        wishlist_ref.set({"productId": product_id, "addedAt": datetime.now(timezone.utc).isoformat()})
+        return jsonify({"status": "success"}), 200
+        
+    if request.method == "DELETE":
+        wishlist_ref.delete()
+        return jsonify({"status": "success"}), 200
+        
+@app.route("/api/v1/customer/wishlist/check/<product_id>", methods=["GET"])
+def check_wishlist(product_id):
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    user = _verify_bearer()
+    if not user: return jsonify({"inWishlist": False}), 200
+    snap = db.collection("users").document(user["uid"]).collection("wishlist").document(v_doc_id(product_id, "product_id")).get()
+    return jsonify({"inWishlist": snap.exists}), 200
+
+@app.route("/api/v1/customer/cart", methods=["GET", "POST"])
+def manage_cart():
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    user = _verify_bearer()
+    if not user: return jsonify({"error": "Unauthorized"}), 401
+    cart_ref = db.collection("carts").document(user["uid"])
+    
+    if request.method == "GET":
+        snap = cart_ref.get()
+        return jsonify(snap.to_dict().get("items", []) if snap.exists else []), 200
+        
+    data = request.get_json()
+    cart_ref.set({"items": data.get("items", [])}, merge=True)
+    return jsonify({"status": "success"}), 200
+
+@app.route("/api/v1/customer/addresses", methods=["GET", "POST"])
+def manage_addresses():
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    user = _verify_bearer()
+    if not user: return jsonify({"error": "Unauthorized"}), 401
+    user_ref = db.collection("users").document(user["uid"])
+    
+    if request.method == "GET":
+        snap = user_ref.get()
+        return jsonify(snap.to_dict().get("addresses", []) if snap.exists else []), 200
+        
+    data = request.get_json()
+    if request.method == "POST":
+        user_ref.set({"addresses": data.get("addresses", [])}, merge=True)
+        return jsonify({"status": "success"}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
