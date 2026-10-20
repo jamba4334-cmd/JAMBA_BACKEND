@@ -35,11 +35,13 @@ logger = logging.getLogger("jambawear_api")
 
 app = Flask(__name__)
 
+# SECURITY: never fall back to "*". Set ALLOWED_ORIGINS=https://jambawear.in,https://www.jambawear.in
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",") if o.strip()]
 CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}},
      allow_headers=["Authorization", "Content-Type"], methods=["GET", "POST", "PUT", "DELETE"], max_age=600)
-app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2 MB request cap
 
+# SECURITY: super-admin email comes only from the environment (set ADMIN_EMAIL in .env).
 ALLOWED_ADMIN_EMAIL = (os.getenv("ADMIN_EMAIL") or "").strip().lower()
 
 # ==========================================
@@ -620,9 +622,50 @@ def admin_finance_kpis():
     try:
         pending_payouts = sum([float(doc.to_dict().get("amount", doc.to_dict().get("netPayable", 0))) for doc in db.collection("payout_requests").where("status", "==", "pending").get()])
         in_escrow = sum([float(doc.to_dict().get("total", 0)) for doc in db.collection("orders").where("status", "==", "paid").get()])
-        jamba_revenue = sum([float(doc.to_dict().get("jambaFee", 0)) for doc in db.collection("payout_requests").where("status", "==", "paid").get()])
+        
+        config_doc = db.collection("settings").document("financial_settings").get()
+        config = config_doc.to_dict() if config_doc.exists else {}
+        raw_comm_brackets = config.get("commissionBrackets", [{"maxLimit": 1499, "rate": 25.0}, {"maxLimit": 3999, "rate": 18.0}, {"maxLimit": 999999, "rate": 10.0}])
+        comm_brackets = sorted(raw_comm_brackets, key=lambda x: float(x.get("maxLimit", 999999)))
+        
+        jamba_revenue = 0.0
+        orders = db.collection("orders").where("status", "in", ["paid", "processing", "delivered", "settled_override"]).get()
+        for doc in orders:
+            order = doc.to_dict()
+            order_discount = float(order.get("discount_applied", 0))
+            promo_role = order.get("promo_creator_role")
+            promo_email = order.get("promo_seller_email")
+            order_subtotal = float(order.get("subtotal", 0))
+            
+            for item in order.get("items", []):
+                item_price = float(item.get("price", 0))
+                item_qty = int(item.get("quantity", 1))
+                gross_item_revenue = item_price * item_qty
+                seller_email = item.get("sellerEmail", "")
+                
+                item_discount = 0
+                if order_discount > 0:
+                    if promo_role == "admin" and order_subtotal > 0:
+                        item_discount = order_discount * (gross_item_revenue / order_subtotal)
+                    elif promo_role == "seller" and promo_email == seller_email:
+                        seller_items = [i for i in order.get("items", []) if i.get("sellerEmail") == seller_email]
+                        seller_gross = sum(float(i.get("price", 0)) * int(i.get("quantity", 1)) for i in seller_items)
+                        if seller_gross > 0: item_discount = order_discount * (gross_item_revenue / seller_gross)
+
+                discounted_item_revenue = max(gross_item_revenue - item_discount, 0)
+
+                applied_comm_rate = 30.0
+                for cb in comm_brackets:
+                    if item_price <= float(cb.get("maxLimit", 999999)):
+                        applied_comm_rate = float(cb.get("rate", 30.0))
+                        break
+                        
+                jamba_revenue += discounted_item_revenue * (applied_comm_rate / 100.0)
+
         return jsonify({"jambaRevenue": round(jamba_revenue, 2), "pendingPayouts": round(pending_payouts, 2), "inEscrow": round(in_escrow, 2), "totalGST": round(jamba_revenue * 0.18, 2)}), 200
-    except Exception as e: return jsonify({"error": "Internal server error"}), 500
+    except Exception as e:
+        logger.error(f"Error fetching finance KPIs: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/admin/transactions", methods=["GET"])
 @admin_required
@@ -673,11 +716,9 @@ def get_isolated_seller_data():
     try:
         current_seller_email = request.seller_email 
         
-        # 1. Fetch Tax Configs (Now with SLABS)
         config_doc = db.collection("settings").document("financial_settings").get()
         config = config_doc.to_dict() if config_doc.exists else {}
         
-        # SLAB LOGIC FOR PLATFORM COMMISSION
         raw_comm_brackets = config.get("commissionBrackets", [
             {"maxLimit": 1499, "rate": 25.0}, 
             {"maxLimit": 3999, "rate": 18.0}, 
@@ -689,11 +730,8 @@ def get_isolated_seller_data():
         raw_brackets = config.get("gstBrackets", [{"maxLimit": 2500, "rate": 5.0}, {"maxLimit": 999999, "rate": 18.0}])
         gst_brackets = sorted(raw_brackets, key=lambda x: float(x.get("maxLimit", 999999)))
         
-        # 2. Fetch Seller's KYC Status
         seller_doc = db.collection("authorized_sellers").document(current_seller_email).get()
-        has_gst = False
-        if seller_doc.exists:
-            has_gst = seller_doc.to_dict().get("kycData", {}).get("hasGst", False)
+        has_gst = seller_doc.to_dict().get("kycData", {}).get("hasGst", False) if seller_doc.exists else False
 
         orders_query = db.collection("orders").where("sellerEmails", "array_contains", current_seller_email).get()
         secure_wallet = {"available": 0, "pending": 0, "lifetime": 0}
@@ -721,9 +759,8 @@ def get_isolated_seller_data():
                 if seller_bears_discount and seller_gross_total > 0:
                     item_discount = order_discount * (gross_item_revenue / seller_gross_total)
                     
-                discounted_item_revenue = gross_item_revenue - item_discount
+                discounted_item_revenue = max(gross_item_revenue - item_discount, 0)
                 
-                # Dynamic Commission Match
                 applied_comm_rate = 30.0
                 for cb in comm_brackets:
                     if item_price <= float(cb.get("maxLimit", 999999)):
@@ -766,7 +803,9 @@ def get_isolated_seller_data():
             "wallet": {"available": round(secure_wallet["available"], 2), "pending": round(secure_wallet["pending"], 2), "lifetime": round(secure_wallet["lifetime"], 2)},
             "sales_ledger": isolated_sales_ledger
         }), 200
-    except Exception as e: return jsonify({"error": "Failed to route financial data"}), 500
+    except Exception as e: 
+        logger.error(f"Pipeline error for seller {request.seller_email}: {str(e)}", exc_info=True)
+        return jsonify({"error": "Failed to route financial data"}), 500
 
 @app.route("/api/v1/seller/payouts/history", methods=["GET"])
 @seller_required
@@ -819,7 +858,7 @@ def compute_available_balance(seller_email):
             gross_item_revenue = item_price * item_qty
             
             item_discount = order_discount * (gross_item_revenue / seller_gross_total) if (seller_bears_discount and seller_gross_total > 0) else 0
-            discounted_item_revenue = gross_item_revenue - item_discount
+            discounted_item_revenue = max(gross_item_revenue - item_discount, 0)
             
             applied_comm_rate = 30.0
             for cb in comm_brackets:
@@ -863,7 +902,7 @@ def request_payout():
     except Exception as e: return jsonify({"error": "Internal server error"}), 500
 
 # ==========================================
-# 9. PROMO CODE ENGINE & CHECKOUT VALIDATION (OMITTED FOR BREVITY - REMAINS UNCHANGED)
+# 9. PROMO CODE ENGINE & CHECKOUT VALIDATION
 # ==========================================
 @app.route("/admin/promocodes", methods=["GET", "POST"])
 @admin_required
