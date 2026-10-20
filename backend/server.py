@@ -954,26 +954,28 @@ def get_isolated_seller_data():
     try:
         current_seller_email = request.seller_email 
         
+        # 1. Fetch Tax Configs
         config_doc = db.collection("settings").document("financial_settings").get()
         config = config_doc.to_dict() if config_doc.exists else {}
-        
         commission_percent = float(config.get("platformCommission", 30.0))
         tcs_percent = float(config.get("tcsRate", 1.0))
-        
         raw_brackets = config.get("gstBrackets", [{"maxLimit": 2500, "rate": 5.0}, {"maxLimit": 999999, "rate": 18.0}])
         gst_brackets = sorted(raw_brackets, key=lambda x: float(x.get("maxLimit", 999999)))
         
+        # 2. Fetch Seller's KYC Status (Checking if they are Registered for GST)
+        seller_doc = db.collection("authorized_sellers").document(current_seller_email).get()
+        has_gst = False
+        if seller_doc.exists:
+            has_gst = seller_doc.to_dict().get("kycData", {}).get("hasGst", False)
+
         orders_query = db.collection("orders").where("sellerEmails", "array_contains", current_seller_email).get()
-        
         secure_wallet = {"available": 0, "pending": 0, "lifetime": 0}
         isolated_sales_ledger = []
         
         for doc in orders_query:
             order = doc.to_dict()
             order_status = order.get("status", "pending")
-            
-            if order_status not in ["paid", "processing", "delivered", "settled_override"]: 
-                continue
+            if order_status not in ["paid", "processing", "delivered", "settled_override"]: continue
                 
             order_discount = float(order.get("discount_applied", 0))
             promo_role = order.get("promo_creator_role")
@@ -996,7 +998,6 @@ def get_isolated_seller_data():
                 jamba_fee = discounted_item_revenue * (commission_percent / 100.0)
                 commission_gst = jamba_fee * 0.18
                 
-                # Match live price against dynamic GST brackets for Seller Dashboard
                 product_gst_percent = 18.0
                 for bracket in gst_brackets:
                     if item_price <= float(bracket.get("maxLimit", 999999)):
@@ -1004,7 +1005,9 @@ def get_isolated_seller_data():
                         break
                     
                 net_product_value = discounted_item_revenue / (1 + (product_gst_percent / 100.0))
-                tcs_amount = net_product_value * (tcs_percent / 100.0)
+                
+                # ZERO-TRUST LOGIC: Only apply TCS if the seller is GST registered
+                tcs_amount = (net_product_value * (tcs_percent / 100.0)) if has_gst else 0.0
                 
                 net_seller_earnings = discounted_item_revenue - jamba_fee - commission_gst - tcs_amount
                 
@@ -1021,23 +1024,20 @@ def get_isolated_seller_data():
                     "status": order_status
                 })
                 
-                if order_status in ["delivered", "settled_override"]:
-                    secure_wallet["available"] += net_seller_earnings
-                elif order_status in ["paid", "processing"]:
-                    secure_wallet["pending"] += net_seller_earnings
-                
+                if order_status in ["delivered", "settled_override"]: secure_wallet["available"] += net_seller_earnings
+                elif order_status in ["paid", "processing"]: secure_wallet["pending"] += net_seller_earnings
                 secure_wallet["lifetime"] += net_seller_earnings
 
         payouts_query = db.collection("payout_requests").where("email", "==", current_seller_email).get()
         for doc in payouts_query:
             amt = float(doc.to_dict().get("amount", 0))
-            if doc.to_dict().get("status") in ["paid", "pending"]:
-                secure_wallet["available"] -= amt
+            if doc.to_dict().get("status") in ["paid", "pending"]: secure_wallet["available"] -= amt
             
         if secure_wallet["available"] < 0: secure_wallet["available"] = 0
         isolated_sales_ledger.sort(key=lambda x: x.get("date", ""), reverse=True)
 
         return jsonify({
+            "hasGst": has_gst,
             "wallet": {
                 "available": round(secure_wallet["available"], 2),
                 "pending": round(secure_wallet["pending"], 2),
@@ -1064,35 +1064,69 @@ def get_payout_history():
 
 def compute_available_balance(seller_email):
     """Server-side source of truth for what a seller can withdraw."""
-    cfg_doc = db.collection("platform_config").document("tax").get()
+    cfg_doc = db.collection("settings").document("financial_settings").get()
     cfg = cfg_doc.to_dict() if cfg_doc.exists else {}
-    commission = float(cfg.get("commissionPct", 10)) / 100
-    gst_on_comm = float(cfg.get("gstOnCommissionPct", 18)) / 100
-    tcs = float(cfg.get("tcsPct", 1)) / 100
-    tds = float(cfg.get("tdsPct", 0.1)) / 100
-    hold_days = int(cfg.get("holdDays", 7))
+    commission_percent = float(cfg.get("platformCommission", 30.0))
+    tcs_percent = float(cfg.get("tcsRate", 1.0))
+    raw_brackets = cfg.get("gstBrackets", [{"maxLimit": 2500, "rate": 5.0}, {"maxLimit": 999999, "rate": 18.0}])
+    gst_brackets = sorted(raw_brackets, key=lambda x: float(x.get("maxLimit", 999999)))
+    
+    hold_days = 7
     cutoff = datetime.now(timezone.utc).timestamp() - hold_days * 86400
+    
+    # Check if seller is registered
+    seller_doc = db.collection("authorized_sellers").document(seller_email).get()
+    has_gst = False
+    if seller_doc.exists:
+        has_gst = seller_doc.to_dict().get("kycData", {}).get("hasGst", False)
+
     earned = 0.0
     for o in db.collection("orders").where("sellerEmails", "array_contains", seller_email).get():
         od = o.to_dict()
-        if od.get("status") != "delivered":
-            continue
+        if od.get("status") != "delivered": continue
         delivered_at = od.get("delivered_at") or od.get("created_at") or ""
         try:
-            if datetime.fromisoformat(str(delivered_at).replace("Z", "+00:00")).timestamp() > cutoff:
-                continue
-        except ValueError:
-            continue
-        for it in od.get("items", []):
-            if (it.get("sellerEmail") or "").lower() != seller_email:
-                continue
-            gross = float(it.get("price", 0)) * int(it.get("quantity", 1))
-            earned += gross - gross * commission * (1 + gst_on_comm) - gross * tcs - gross * tds
+            if datetime.fromisoformat(str(delivered_at).replace("Z", "+00:00")).timestamp() > cutoff: continue
+        except ValueError: continue
+        
+        order_discount = float(od.get("discount_applied", 0))
+        promo_role = od.get("promo_creator_role")
+        promo_email = od.get("promo_seller_email")
+        seller_bears_discount = (promo_role == "seller" and promo_email == seller_email)
+        
+        seller_items = [i for i in od.get("items", []) if (i.get("sellerEmail") or "").lower() == seller_email.lower()]
+        seller_gross_total = sum(float(i.get("price", 0)) * int(i.get("quantity", 1)) for i in seller_items)
+
+        for it in seller_items:
+            item_price = float(it.get("price", 0))
+            item_qty = int(it.get("quantity", 1))
+            gross_item_revenue = item_price * item_qty
+            
+            item_discount = 0
+            if seller_bears_discount and seller_gross_total > 0:
+                item_discount = order_discount * (gross_item_revenue / seller_gross_total)
+                
+            discounted_item_revenue = gross_item_revenue - item_discount
+            jamba_fee = discounted_item_revenue * (commission_percent / 100.0)
+            commission_gst = jamba_fee * 0.18
+            
+            product_gst_percent = 18.0
+            for bracket in gst_brackets:
+                if item_price <= float(bracket.get("maxLimit", 999999)):
+                    product_gst_percent = float(bracket.get("rate", 18.0))
+                    break
+            
+            net_product_value = discounted_item_revenue / (1 + (product_gst_percent / 100.0))
+            tcs_deduction = (net_product_value * (tcs_percent / 100.0)) if has_gst else 0.0
+            
+            earned += discounted_item_revenue - jamba_fee - commission_gst - tcs_deduction
+            
     withdrawn = 0.0
     for p in db.collection("payout_requests").where("email", "==", seller_email).get():
         pd = p.to_dict()
         if pd.get("status") in ("pending", "approved", "paid", "on_hold"):
             withdrawn += float(pd.get("amount", 0))
+            
     return round(max(earned - withdrawn, 0), 2)
 
 @app.route("/api/v1/seller/payouts/request", methods=["POST"])
