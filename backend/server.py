@@ -4,6 +4,7 @@
 import os
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from functools import wraps
 
@@ -228,6 +229,48 @@ def public_financial_settings():
     except Exception as e:
         logger.error(f"Error fetching public settings: {str(e)}")
         return jsonify({"error": "Internal server error"}), 500
+
+# --- Simple In-Memory Cache for Storefronts ---
+storefront_cache = {"data": {}, "timestamp": 0}
+CACHE_DURATION = 3600  # Cache lives for 1 hour (3600 seconds)
+
+@app.route('/api/v1/public/storefronts', methods=['GET'])
+@limiter.limit("50 per minute")
+def get_public_storefronts():
+    current_time = time.time()
+    
+    # 1. Return cached data if it is less than 1 hour old
+    if current_time - storefront_cache["timestamp"] < CACHE_DURATION and storefront_cache["data"]:
+        return jsonify(storefront_cache["data"]), 200
+
+    # 2. If cache is empty or expired, fetch securely from Firestore
+    try:
+        if db is None: return jsonify({"error": "Database unavailable"}), 503
+        profiles_ref = db.collection('seller_profiles').stream()
+        profiles_map = {}
+        
+        for doc in profiles_ref:
+            data = doc.to_dict()
+            storefront = data.get('storefront', {})
+            handle = storefront.get('vanityHandle', '').lower()
+            
+            if handle:
+                # ONLY return safe, public data. Strip everything else (bank info, phone, address).
+                profiles_map[handle] = {
+                    "brandLogo": storefront.get('brandLogo', ''),
+                    "brandName": storefront.get('brandName', ''),
+                    "vanityHandle": handle
+                }
+        
+        # 3. Update the cache with the fresh data
+        storefront_cache["data"] = profiles_map
+        storefront_cache["timestamp"] = current_time
+                
+        return jsonify(profiles_map), 200
+    except Exception as e:
+        logger.error(f"Error fetching storefronts: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/create-order", methods=["POST"])
 @limiter.limit("5 per minute")
