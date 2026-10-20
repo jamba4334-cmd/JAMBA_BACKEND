@@ -229,9 +229,8 @@ def public_financial_settings():
         logger.error(f"Error fetching public settings: {str(e)}")
         return jsonify({"error": "Internal server error"}), 500
 
-# --- Simple In-Memory Cache for Homepage Storefront Circles ---
 storefront_cache = {"data": {}, "timestamp": 0}
-CACHE_DURATION = 3600  # Cache lives for 1 hour
+CACHE_DURATION = 3600  
 
 @app.route('/api/v1/public/storefronts', methods=['GET'])
 @limiter.limit("50 per minute")
@@ -267,7 +266,6 @@ def get_public_storefronts():
         return jsonify({"error": str(e)}), 500
 
 
-# --- Secure Fetch for Individual Brand Pages ---
 @app.route('/api/v1/public/storefront/<handle>', methods=['GET'])
 @limiter.limit("30 per minute")
 def get_single_storefront(handle):
@@ -801,8 +799,52 @@ def update_payout(payout_id):
     except Exception as e: return jsonify({"error": "Internal server error"}), 500
 
 # ==========================================
-# 8. SELLER FINANCE & PAYOUT ROUTES (SLAB MODE)
+# 8. SELLER FINANCE, PAYOUT ROUTES & ORDERS
 # ==========================================
+@app.route("/api/v1/seller/orders", methods=["GET"])
+@seller_required
+def get_seller_orders():
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    try:
+        current_seller_email = request.seller_email
+        orders_query = db.collection("orders").where("sellerEmails", "array_contains", current_seller_email).get()
+        
+        seller_orders = []
+        for doc in orders_query:
+            order_data = doc.to_dict()
+            order_data["id"] = doc.id
+            
+            isolated_items = [item for item in order_data.get("items", []) if (item.get("sellerEmail") or "").lower() == current_seller_email.lower()]
+            order_data["items"] = isolated_items
+            order_data["sellerSubtotal"] = sum(float(item.get("price", 0)) * int(item.get("quantity", 1)) for item in isolated_items)
+            
+            order_data.pop("total", None)
+            order_data.pop("subtotal", None)
+            order_data.pop("total_gst", None)
+            
+            seller_orders.append(order_data)
+            
+        seller_orders.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        return jsonify(seller_orders), 200
+    except Exception as e:
+        logger.error(f"Error fetching orders: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route("/api/v1/seller/orders/<order_id>/accept", methods=["POST"])
+@seller_required
+def accept_seller_order(order_id):
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    try:
+        order_ref = db.collection("orders").document(v_doc_id(order_id))
+        order_doc = order_ref.get()
+        if not order_doc.exists or request.seller_email not in order_doc.to_dict().get("sellerEmails", []):
+            return jsonify({"error": "Order not found or unauthorized"}), 404
+            
+        order_ref.update({"seller_accepted": True, "accepted_at": datetime.now(timezone.utc).isoformat()})
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        return jsonify({"error": "Internal server error"}), 500
+
 @app.route("/api/v1/seller/dashboard", methods=["GET"])
 @seller_required
 def get_isolated_seller_data():
@@ -990,17 +1032,29 @@ def request_payout():
     try:
         data = request.get_json()
         amount = v_float(data.get("amount", 0), 1, 10_000_000, "amount")
-        if amount > compute_available_balance(request.seller_email): return jsonify({"error": "Amount exceeds available balance"}), 400
-        if len(db.collection("payout_requests").where("email", "==", request.seller_email).where("status", "==", "pending").limit(1).get()) > 0:
-            return jsonify({"error": "You already have a pending payout request"}), 400
+        if amount > compute_available_balance(request.seller_email): 
+            return jsonify({"error": "Amount exceeds available balance"}), 400
 
-        _, doc_ref = db.collection("payout_requests").add({
-            "email": request.seller_email, "brand": v_str(data.get("brand", "Unknown Brand"), 100, "brand"),
-            "amount": amount, "netPayable": amount, "status": "pending",
-            "created_at": datetime.now(timezone.utc).isoformat(), "utr": ""
-        })
-        
-        response_payload = {"status": "success", "id": doc_ref.id}
+        # ATOMIC TRANSACTION TO PREVENT RACE CONDITIONS
+        transaction = db.transaction()
+        pending_query = db.collection("payout_requests").where("email", "==", request.seller_email).where("status", "==", "pending").limit(1)
+
+        @firestore.transactional
+        def process_payout_safely(transaction, query):
+            existing = list(query.stream(transaction=transaction))
+            if len(existing) > 0:
+                raise ValueError("You already have a pending payout request")
+                
+            new_ref = db.collection("payout_requests").document()
+            transaction.set(new_ref, {
+                "email": request.seller_email, "brand": v_str(data.get("brand", "Unknown Brand"), 100, "brand"),
+                "amount": amount, "netPayable": amount, "status": "pending",
+                "created_at": datetime.now(timezone.utc).isoformat(), "utr": ""
+            })
+            return new_ref.id
+
+        new_id = process_payout_safely(transaction, pending_query)
+        response_payload = {"status": "success", "id": new_id}
         
         if idempotency_key:
             db.collection("idempotency_logs").document(idempotency_key).set({
@@ -1008,6 +1062,7 @@ def request_payout():
             })
             
         return jsonify(response_payload), 201
+    except ValueError as ve: return jsonify({"error": str(ve)}), 400
     except Exception as e: return jsonify({"error": "Internal server error"}), 500
 
 # ==========================================
