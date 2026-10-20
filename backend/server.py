@@ -97,7 +97,6 @@ def v_str(value, max_len=200, field="text"):
 
 def pick(data, allowed): return {k: data[k] for k in allowed if k in data}
 
-# 🔒 NEW: Added "approval_status" to the whitelist so admins can approve products
 PRODUCT_FIELDS = ["name", "description", "selling_price", "mrp", "category", "tribe", "images",
                   "sizes", "colors", "stock", "isReturnable", "brandName", "sellerName",
                   "sellerEmail", "item_id", "status", "tags", "hsn", "weight", "approval_status"]
@@ -230,20 +229,18 @@ def public_financial_settings():
         logger.error(f"Error fetching public settings: {str(e)}")
         return jsonify({"error": "Internal server error"}), 500
 
-# --- Simple In-Memory Cache for Storefronts ---
+# --- Simple In-Memory Cache for Homepage Storefront Circles ---
 storefront_cache = {"data": {}, "timestamp": 0}
-CACHE_DURATION = 3600  # Cache lives for 1 hour (3600 seconds)
+CACHE_DURATION = 3600  # Cache lives for 1 hour
 
 @app.route('/api/v1/public/storefronts', methods=['GET'])
 @limiter.limit("50 per minute")
 def get_public_storefronts():
     current_time = time.time()
     
-    # 1. Return cached data if it is less than 1 hour old
     if current_time - storefront_cache["timestamp"] < CACHE_DURATION and storefront_cache["data"]:
         return jsonify(storefront_cache["data"]), 200
 
-    # 2. If cache is empty or expired, fetch securely from Firestore
     try:
         if db is None: return jsonify({"error": "Database unavailable"}), 503
         profiles_ref = db.collection('seller_profiles').stream()
@@ -255,14 +252,12 @@ def get_public_storefronts():
             handle = storefront.get('vanityHandle', '').lower()
             
             if handle:
-                # ONLY return safe, public data. Strip everything else (bank info, phone, address).
                 profiles_map[handle] = {
                     "brandLogo": storefront.get('brandLogo', ''),
                     "brandName": storefront.get('brandName', ''),
                     "vanityHandle": handle
                 }
         
-        # 3. Update the cache with the fresh data
         storefront_cache["data"] = profiles_map
         storefront_cache["timestamp"] = current_time
                 
@@ -272,12 +267,36 @@ def get_public_storefronts():
         return jsonify({"error": str(e)}), 500
 
 
+# --- Secure Fetch for Individual Brand Pages ---
+@app.route('/api/v1/public/storefront/<handle>', methods=['GET'])
+@limiter.limit("30 per minute")
+def get_single_storefront(handle):
+    try:
+        if db is None: return jsonify({"error": "Database unavailable"}), 503
+        
+        profiles_ref = db.collection('seller_profiles').stream()
+        
+        for doc in profiles_ref:
+            data = doc.to_dict()
+            storefront = data.get('storefront', {})
+            doc_handle = storefront.get('vanityHandle', '').lower()
+            
+            if doc_handle == handle.lower():
+                response_data = storefront.copy()
+                response_data["sellerEmail"] = doc.id
+                return jsonify(response_data), 200
+                
+        return jsonify({"error": "Storefront not found"}), 404
+    except Exception as e:
+        logger.error(f"Error fetching storefront {handle}: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
+
+
 @app.route("/create-order", methods=["POST"])
 @limiter.limit("5 per minute")
 def create_order():
     if db is None: return jsonify({"error": "Service temporarily unavailable."}), 503
     
-    # IDEMPOTENCY CHECK
     idempotency_key = request.headers.get("Idempotency-Key")
     if idempotency_key:
         existing_req = db.collection("idempotency_logs").document(idempotency_key).get()
@@ -962,7 +981,6 @@ def compute_available_balance(seller_email):
 def request_payout():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     
-    # IDEMPOTENCY CHECK
     idempotency_key = request.headers.get("Idempotency-Key")
     if idempotency_key:
         existing_req = db.collection("idempotency_logs").document(idempotency_key).get()
