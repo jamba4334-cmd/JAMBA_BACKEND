@@ -11,6 +11,9 @@ from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from dotenv import load_dotenv
 
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
 import razorpay
 import firebase_admin
 from firebase_admin import credentials, firestore, auth as firebase_auth
@@ -35,13 +38,19 @@ logger = logging.getLogger("jambawear_api")
 
 app = Flask(__name__)
 
-# SECURITY: never fall back to "*". Set ALLOWED_ORIGINS=https://jambawear.in,https://www.jambawear.in
+# SECURITY: Rate Limiter Setup (Prevents DDoS and Brute Force)
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["500 per day", "100 per hour"],
+    storage_uri="memory://"
+)
+
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",") if o.strip()]
 CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}},
-     allow_headers=["Authorization", "Content-Type"], methods=["GET", "POST", "PUT", "DELETE"], max_age=600)
-app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2 MB request cap
+     allow_headers=["Authorization", "Content-Type", "Idempotency-Key"], methods=["GET", "POST", "PUT", "DELETE"], max_age=600)
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  
 
-# SECURITY: super-admin email comes only from the environment (set ADMIN_EMAIL in .env).
 ALLOWED_ADMIN_EMAIL = (os.getenv("ADMIN_EMAIL") or "").strip().lower()
 
 # ==========================================
@@ -87,9 +96,10 @@ def v_str(value, max_len=200, field="text"):
 
 def pick(data, allowed): return {k: data[k] for k in allowed if k in data}
 
+# 🔒 NEW: Added "approval_status" to the whitelist so admins can approve products
 PRODUCT_FIELDS = ["name", "description", "selling_price", "mrp", "category", "tribe", "images",
                   "sizes", "colors", "stock", "isReturnable", "brandName", "sellerName",
-                  "sellerEmail", "item_id", "status", "tags", "hsn", "weight"]
+                  "sellerEmail", "item_id", "status", "tags", "hsn", "weight", "approval_status"]
 ORDER_ADMIN_FIELDS = ["status", "tracking_id", "courier", "admin_note", "delivered_at", "return_status"]
 PAYOUT_ADMIN_FIELDS = ["status", "utr", "admin_note"]
 
@@ -101,6 +111,10 @@ def handle_too_large(_e): return jsonify({"error": "Request too large"}), 413
 
 @app.errorhandler(404)
 def handle_404(_e): return jsonify({"error": "Not found"}), 404
+
+@app.errorhandler(429)
+def handle_rate_limit(e):
+    return jsonify({"error": f"Rate limit exceeded: {e.description}"}), 429
 
 @app.errorhandler(Exception)
 def handle_unexpected(e):
@@ -201,9 +215,11 @@ def optional_user(): return _verify_bearer()
 # 5. PUBLIC ROUTES (Customer Facing)
 # ==========================================
 @app.route("/health", methods=["GET"])
+@limiter.exempt
 def health(): return jsonify({"server": "running", "status": "ok"}), 200
 
 @app.route("/api/v1/public/settings/financial", methods=["GET"])
+@limiter.limit("60 per minute")
 def public_financial_settings():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     try:
@@ -214,8 +230,17 @@ def public_financial_settings():
         return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/create-order", methods=["POST"])
+@limiter.limit("5 per minute")
 def create_order():
     if db is None: return jsonify({"error": "Service temporarily unavailable."}), 503
+    
+    # IDEMPOTENCY CHECK
+    idempotency_key = request.headers.get("Idempotency-Key")
+    if idempotency_key:
+        existing_req = db.collection("idempotency_logs").document(idempotency_key).get()
+        if existing_req.exists:
+            return jsonify(existing_req.to_dict().get("response")), 201
+
     try:
         data = request.get_json()
         if not data or not isinstance(data, dict): return jsonify({"error": "Invalid payload."}), 400
@@ -233,7 +258,6 @@ def create_order():
         payment_method = "COD" if str(data.get("payment_method", "Razorpay")).strip().upper() == "COD" else "Razorpay"
         promo_code_str = str(data.get("promo_code", data.get("promo_used", ""))).strip().upper()
 
-        # FETCH CONFIGS
         config_doc = db.collection("settings").document("financial_settings").get()
         config = config_doc.to_dict() if config_doc.exists else {}
         free_shipping_min = float(config.get("shippingFreeThreshold", 1999.0))
@@ -242,7 +266,6 @@ def create_order():
         raw_brackets = config.get("gstBrackets", [{"maxLimit": 2500, "rate": 5.0}, {"maxLimit": 999999, "rate": 18.0}])
         gst_brackets = sorted(raw_brackets, key=lambda x: float(x.get("maxLimit", 999999)))
 
-        # PROMO LOGIC
         promo_data = None
         promo_doc_id = None
         if promo_code_str:
@@ -347,17 +370,26 @@ def create_order():
         if total_discount > 0 and promo_data and promo_data.get("usage_limit") == "single":
             db.collection("promocodes").document(promo_doc_id).update({"used_by": firestore.ArrayUnion([customer_email])})
 
+        response_payload = {}
+
         if payment_method == "COD":
             order_data["status"] = "processing"
             order_data["order_id"] = f"cod_{int(datetime.now().timestamp())}"
             db.collection("orders").add(order_data)
-            return jsonify({"status": "success", "payment_method": "COD", "order_id": order_data["jamba_order_id"]}), 201
+            response_payload = {"status": "success", "payment_method": "COD", "order_id": order_data["jamba_order_id"]}
+        else:
+            if not razorpay_client: return jsonify({"error": "Payment gateway unavailable"}), 503
+            razorpay_order = razorpay_client.order.create({"amount": int(final_total * 100), "currency": "INR", "receipt": f"rcpt_{int(datetime.now().timestamp())}"})
+            order_data["razorpay_order_id"] = razorpay_order["id"]
+            db.collection("orders").add(order_data)
+            response_payload = razorpay_order
 
-        if not razorpay_client: return jsonify({"error": "Payment gateway unavailable"}), 503
-        razorpay_order = razorpay_client.order.create({"amount": int(final_total * 100), "currency": "INR", "receipt": f"rcpt_{int(datetime.now().timestamp())}"})
-        order_data["razorpay_order_id"] = razorpay_order["id"]
-        db.collection("orders").add(order_data)
-        return jsonify(razorpay_order), 201
+        if idempotency_key:
+            db.collection("idempotency_logs").document(idempotency_key).set({
+                "response": response_payload, "created_at": datetime.now(timezone.utc).isoformat()
+            })
+
+        return jsonify(response_payload), 201
 
     except ValueError as ve: return jsonify({"error": "Invalid format."}), 400
     except Exception as e:
@@ -886,6 +918,14 @@ def compute_available_balance(seller_email):
 @seller_required
 def request_payout():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
+    
+    # IDEMPOTENCY CHECK
+    idempotency_key = request.headers.get("Idempotency-Key")
+    if idempotency_key:
+        existing_req = db.collection("idempotency_logs").document(idempotency_key).get()
+        if existing_req.exists:
+            return jsonify(existing_req.to_dict().get("response")), 201
+
     try:
         data = request.get_json()
         amount = v_float(data.get("amount", 0), 1, 10_000_000, "amount")
@@ -898,7 +938,15 @@ def request_payout():
             "amount": amount, "netPayable": amount, "status": "pending",
             "created_at": datetime.now(timezone.utc).isoformat(), "utr": ""
         })
-        return jsonify({"status": "success", "id": doc_ref.id}), 201
+        
+        response_payload = {"status": "success", "id": doc_ref.id}
+        
+        if idempotency_key:
+            db.collection("idempotency_logs").document(idempotency_key).set({
+                "response": response_payload, "created_at": datetime.now(timezone.utc).isoformat()
+            })
+            
+        return jsonify(response_payload), 201
     except Exception as e: return jsonify({"error": "Internal server error"}), 500
 
 # ==========================================
@@ -952,6 +1000,7 @@ def seller_promocodes():
     except Exception as e: return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/api/v1/promocodes/validate", methods=["POST"])
+@limiter.limit("10 per minute")
 def validate_promocode():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     try:
