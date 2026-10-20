@@ -388,12 +388,24 @@ def create_order():
             if promo_data and promo_data.get("creator_role") == "seller" and promo_data.get("seller_email") == seller_email:
                 seller_eligible_subtotal += item_total
 
+            # 🔥 FIX: Extract the primary image safely
+            product_images = product.get("images", [])
+            primary_image = product_images[0] if isinstance(product_images, list) and len(product_images) > 0 else ""
+
             enriched_cart.append({
-                "id": item_id, "quantity": quantity, "size": v_str(item.get("size", ""), 20, "size"),
-                "color": v_str(item.get("color", ""), 40, "color"), "name": product.get("name", product.get("title", "")),
-                "price": real_price, "brandName": product.get("brandName", "JAMBA WEAR"), "sellerName": product.get("sellerName", ""),
-                "sellerEmail": seller_email, "isReturnable": product.get("isReturnable", True), "hsn": product.get("hsn", "6204"),
-                "applied_gst_rate": effective_gst_rate
+                "id": item_id, 
+                "quantity": quantity, 
+                "size": v_str(item.get("size", ""), 20, "size"),
+                "color": v_str(item.get("color", ""), 40, "color"), 
+                "name": product.get("name", product.get("title", "")),
+                "price": real_price, 
+                "brandName": product.get("brandName", "JAMBA WEAR"), 
+                "sellerName": product.get("sellerName", ""),
+                "sellerEmail": seller_email, 
+                "isReturnable": product.get("isReturnable", True), 
+                "hsn": product.get("hsn", "6204"),
+                "applied_gst_rate": effective_gst_rate,
+                "image": primary_image  # <-- Fixed image mapping
             })
 
         total_discount = 0.0
