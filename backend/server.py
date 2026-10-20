@@ -227,6 +227,16 @@ def optional_user():
 def health():
     return jsonify({"server": "running", "status": "ok"}), 200
 
+@app.route("/api/v1/public/settings/financial", methods=["GET"])
+def public_financial_settings():
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    try:
+        doc = db.collection("settings").document("financial_settings").get()
+        return jsonify(doc.to_dict() if doc.exists else {}), 200
+    except Exception as e:
+        logger.error(f"Error fetching public settings: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
+
 @app.route("/create-order", methods=["POST"])
 def create_order():
     if db is None: 
