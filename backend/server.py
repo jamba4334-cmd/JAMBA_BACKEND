@@ -18,6 +18,7 @@ from flask_limiter.util import get_remote_address
 import razorpay
 import firebase_admin
 from firebase_admin import credentials, firestore, auth as firebase_auth
+import redis
 
 from fpdf import FPDF
 import io
@@ -152,6 +153,20 @@ try:
 except Exception as e:
     logger.error(f"❌ Razorpay failed: {e}")
     razorpay_client = None
+
+# ZERO TRUST: Connect to Redis securely using TLS and authentication
+try:
+    redis_client = redis.Redis(
+        host=os.getenv("REDIS_HOST", "localhost"),
+        port=int(os.getenv("REDIS_PORT", 6379)),
+        password=os.getenv("REDIS_PASSWORD", ""),
+        ssl=True if os.getenv("REDIS_HOST") else False,
+        decode_responses=True
+    )
+    logger.info("✅ Redis client initialized.")
+except Exception as e:
+    logger.error(f"❌ Redis initialization failed: {e}")
+    redis_client = None
 
 # ==========================================
 # 4. SECURITY MIDDLEWARE & HEADERS
@@ -855,7 +870,11 @@ def get_isolated_seller_data():
         config_doc = db.collection("settings").document("financial_settings").get()
         config = config_doc.to_dict() if config_doc.exists else {}
         
-        raw_comm_brackets = config.get("commissionBrackets", [{"maxLimit": 1499, "rate": 25.0}, {"maxLimit": 3999, "rate": 18.0}, {"maxLimit": 999999, "rate": 10.0}])
+        raw_comm_brackets = config.get("commissionBrackets", [
+            {"maxLimit": 1499, "rate": 25.0}, 
+            {"maxLimit": 3999, "rate": 18.0}, 
+            {"maxLimit": 999999, "rate": 10.0}
+        ])
         comm_brackets = sorted(raw_comm_brackets, key=lambda x: float(x.get("maxLimit", 999999)))
         
         tcs_percent = float(config.get("tcsRate", 1.0))
@@ -1221,21 +1240,67 @@ def get_public_config(doc_id):
     doc_snap = db.collection("settings").document(v_doc_id(doc_id, "doc_id")).get()
     return jsonify(doc_snap.to_dict() if doc_snap.exists else {}), 200
 
+# 🔥 ZERO-TRUST UPDATE: Redis Cache-Aside for Full Product Catalog
+@app.route("/api/v1/public/products", methods=["GET"])
+@limiter.limit("100 per minute")
+def get_all_public_products():
+    cache_key = "global:products:public_catalog"
+    try:
+        if redis_client:
+            cached_data = redis_client.get(cache_key)
+            if cached_data:
+                return jsonify(json.loads(cached_data)), 200
+        
+        if db is None: return jsonify({"error": "DB unavailable"}), 503
+        docs = db.collection("products").get()
+        
+        products = []
+        for doc in docs:
+            data = doc.to_dict()
+            if not data.get("isHidden", False):
+                data["id"] = doc.id
+                products.append(data)
+        
+        if redis_client:
+            redis_client.setex(cache_key, 3600, json.dumps(products))
+            
+        return jsonify(products), 200
+    except Exception as e:
+        logger.error(f"Error fetching catalog: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
+
+# 🔥 ZERO-TRUST UPDATE: Redis Cache-Aside for Individual Product Views
 @app.route("/api/v1/public/products/<item_id>", methods=["GET"])
-@limiter.limit("60 per minute")
+@limiter.limit("100 per minute")
 def get_public_product(item_id):
-    if db is None: return jsonify({"error": "DB unavailable"}), 503
     clean_id = v_doc_id(item_id, "item_id")
-    q = db.collection("products").where("item_id", "==", clean_id).limit(1).get()
-    if not q:
-        doc_snap = db.collection("products").document(clean_id).get()
-        if not doc_snap.exists: return jsonify({"error": "Not found"}), 404
-        data = doc_snap.to_dict()
-        data["id"] = doc_snap.id
+    cache_key = f"global:products:detail:{clean_id}"
+    
+    try:
+        if redis_client:
+            cached_data = redis_client.get(cache_key)
+            if cached_data:
+                return jsonify(json.loads(cached_data)), 200
+        
+        if db is None: return jsonify({"error": "DB unavailable"}), 503
+        
+        q = db.collection("products").where("item_id", "==", clean_id).limit(1).get()
+        if q:
+            data = q[0].to_dict()
+            data["id"] = q[0].id
+        else:
+            doc_snap = db.collection("products").document(clean_id).get()
+            if not doc_snap.exists: return jsonify({"error": "Not found"}), 404
+            data = doc_snap.to_dict()
+            data["id"] = doc_snap.id
+            
+        if redis_client:
+            redis_client.setex(cache_key, 3600, json.dumps(data))
+            
         return jsonify(data), 200
-    data = q[0].to_dict()
-    data["id"] = q[0].id
-    return jsonify(data), 200
+    except Exception as e:
+        logger.error(f"Error fetching product {clean_id}: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/api/v1/public/recommendations/<category>", methods=["GET"])
 def get_recommendations(category):
