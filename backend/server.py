@@ -18,6 +18,7 @@ from flask_limiter.util import get_remote_address
 import razorpay
 import firebase_admin
 from firebase_admin import credentials, firestore, auth as firebase_auth
+import redis
 
 from fpdf import FPDF
 import io
@@ -153,6 +154,20 @@ except Exception as e:
     logger.error(f"❌ Razorpay failed: {e}")
     razorpay_client = None
 
+# ZERO TRUST: Connect to Redis securely using TLS and authentication
+try:
+    redis_client = redis.Redis(
+        host=os.getenv("REDIS_HOST", "localhost"),
+        port=int(os.getenv("REDIS_PORT", 6379)),
+        password=os.getenv("REDIS_PASSWORD", ""),
+        ssl=True if os.getenv("REDIS_HOST") else False, # Enforce SSL in production
+        decode_responses=True
+    )
+    logger.info("✅ Redis client initialized.")
+except Exception as e:
+    logger.error(f"❌ Redis initialization failed: {e}")
+    redis_client = None
+
 # ==========================================
 # 4. SECURITY MIDDLEWARE & HEADERS
 # ==========================================
@@ -229,18 +244,19 @@ def public_financial_settings():
         logger.error(f"Error fetching public settings: {str(e)}")
         return jsonify({"error": "Internal server error"}), 500
 
-storefront_cache = {"data": {}, "timestamp": 0}
-CACHE_DURATION = 3600  
-
 @app.route('/api/v1/public/storefronts', methods=['GET'])
 @limiter.limit("50 per minute")
 def get_public_storefronts():
-    current_time = time.time()
+    cache_key = "global:public_storefronts"
     
-    if current_time - storefront_cache["timestamp"] < CACHE_DURATION and storefront_cache["data"]:
-        return jsonify(storefront_cache["data"]), 200
-
     try:
+        # 1. Check Redis Cache
+        if redis_client:
+            cached_data = redis_client.get(cache_key)
+            if cached_data:
+                return jsonify(json.loads(cached_data)), 200
+            
+        # 2. Cache Miss: Fetch authoritatively from Firestore
         if db is None: return jsonify({"error": "Database unavailable"}), 503
         profiles_ref = db.collection('seller_profiles').stream()
         profiles_map = {}
@@ -257,13 +273,15 @@ def get_public_storefronts():
                     "vanityHandle": handle
                 }
         
-        storefront_cache["data"] = profiles_map
-        storefront_cache["timestamp"] = current_time
-                
+        # 3. Store in Redis with a 1-hour Time-To-Live (TTL)
+        if redis_client:
+            redis_client.setex(cache_key, 3600, json.dumps(profiles_map))
+        
         return jsonify(profiles_map), 200
+        
     except Exception as e:
         logger.error(f"Error fetching storefronts: {str(e)}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Internal server error"}), 500
 
 @app.route('/api/v1/public/storefront/<handle>', methods=['GET'])
 @limiter.limit("30 per minute")
