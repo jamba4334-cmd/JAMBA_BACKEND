@@ -18,7 +18,6 @@ from flask_limiter.util import get_remote_address
 import razorpay
 import firebase_admin
 from firebase_admin import credentials, firestore, auth as firebase_auth
-import redis
 
 from fpdf import FPDF
 import io
@@ -154,20 +153,6 @@ except Exception as e:
     logger.error(f"❌ Razorpay failed: {e}")
     razorpay_client = None
 
-# ZERO TRUST: Connect to Redis securely using TLS and authentication
-try:
-    redis_client = redis.Redis(
-        host=os.getenv("REDIS_HOST", "localhost"),
-        port=int(os.getenv("REDIS_PORT", 6379)),
-        password=os.getenv("REDIS_PASSWORD", ""),
-        ssl=True if os.getenv("REDIS_HOST") else False, # Enforce SSL in production
-        decode_responses=True
-    )
-    logger.info("✅ Redis client initialized.")
-except Exception as e:
-    logger.error(f"❌ Redis initialization failed: {e}")
-    redis_client = None
-
 # ==========================================
 # 4. SECURITY MIDDLEWARE & HEADERS
 # ==========================================
@@ -244,63 +229,50 @@ def public_financial_settings():
         logger.error(f"Error fetching public settings: {str(e)}")
         return jsonify({"error": "Internal server error"}), 500
 
+storefront_cache = {"data": {}, "timestamp": 0}
+CACHE_DURATION = 3600  
+
 @app.route('/api/v1/public/storefronts', methods=['GET'])
 @limiter.limit("50 per minute")
 def get_public_storefronts():
-    cache_key = "global:public_storefronts"
-    
+    current_time = time.time()
+    if current_time - storefront_cache["timestamp"] < CACHE_DURATION and storefront_cache["data"]:
+        return jsonify(storefront_cache["data"]), 200
     try:
-        # 1. Check Redis Cache
-        if redis_client:
-            cached_data = redis_client.get(cache_key)
-            if cached_data:
-                return jsonify(json.loads(cached_data)), 200
-            
-        # 2. Cache Miss: Fetch authoritatively from Firestore
         if db is None: return jsonify({"error": "Database unavailable"}), 503
         profiles_ref = db.collection('seller_profiles').stream()
         profiles_map = {}
-        
         for doc in profiles_ref:
             data = doc.to_dict()
             storefront = data.get('storefront', {})
             handle = storefront.get('vanityHandle', '').lower()
-            
             if handle:
                 profiles_map[handle] = {
                     "brandLogo": storefront.get('brandLogo', ''),
                     "brandName": storefront.get('brandName', ''),
                     "vanityHandle": handle
                 }
-        
-        # 3. Store in Redis with a 1-hour Time-To-Live (TTL)
-        if redis_client:
-            redis_client.setex(cache_key, 3600, json.dumps(profiles_map))
-        
+        storefront_cache["data"] = profiles_map
+        storefront_cache["timestamp"] = current_time
         return jsonify(profiles_map), 200
-        
     except Exception as e:
         logger.error(f"Error fetching storefronts: {str(e)}")
-        return jsonify({"error": "Internal server error"}), 500
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/v1/public/storefront/<handle>', methods=['GET'])
 @limiter.limit("30 per minute")
 def get_single_storefront(handle):
     try:
         if db is None: return jsonify({"error": "Database unavailable"}), 503
-        
         profiles_ref = db.collection('seller_profiles').stream()
-        
         for doc in profiles_ref:
             data = doc.to_dict()
             storefront = data.get('storefront', {})
             doc_handle = storefront.get('vanityHandle', '').lower()
-            
             if doc_handle == handle.lower():
                 response_data = storefront.copy()
                 response_data["sellerEmail"] = doc.id
                 return jsonify(response_data), 200
-                
         return jsonify({"error": "Storefront not found"}), 404
     except Exception as e:
         logger.error(f"Error fetching storefront {handle}: {str(e)}")
@@ -418,6 +390,7 @@ def create_order():
                 "sellerName": product.get("sellerName", ""),
                 "sellerEmail": seller_email, 
                 "isReturnable": product.get("isReturnable", True), 
+                "return_policy": product.get("return_policy", "7_day_return_replace"),
                 "hsn": product.get("hsn", "6204"),
                 "applied_gst_rate": effective_gst_rate,
                 "image": primary_image
@@ -882,11 +855,7 @@ def get_isolated_seller_data():
         config_doc = db.collection("settings").document("financial_settings").get()
         config = config_doc.to_dict() if config_doc.exists else {}
         
-        raw_comm_brackets = config.get("commissionBrackets", [
-            {"maxLimit": 1499, "rate": 25.0}, 
-            {"maxLimit": 3999, "rate": 18.0}, 
-            {"maxLimit": 999999, "rate": 10.0}
-        ])
+        raw_comm_brackets = config.get("commissionBrackets", [{"maxLimit": 1499, "rate": 25.0}, {"maxLimit": 3999, "rate": 18.0}, {"maxLimit": 999999, "rate": 10.0}])
         comm_brackets = sorted(raw_comm_brackets, key=lambda x: float(x.get("maxLimit", 999999)))
         
         tcs_percent = float(config.get("tcsRate", 1.0))
@@ -903,14 +872,26 @@ def get_isolated_seller_data():
         for doc in orders_query:
             order = doc.to_dict()
             order_status = order.get("status", "pending")
-            if order_status not in ["paid", "processing", "delivered", "settled_override"]: continue
+            
+            if order_status == "rto_delivered":
+                rto_penalty = 150.0
+                isolated_sales_ledger.append({
+                    "order_id": order.get("jamba_order_id", "N/A"), "date": order.get("updated_at", order.get("created_at")), "product_name": "RTO Logistics Penalty",
+                    "qty": 0, "gross": 0, "fee": 0, "commission_gst": 0,
+                    "tcs": 0, "net": -rto_penalty, "status": "rto_delivered"
+                })
+                secure_wallet["available"] -= rto_penalty
+                secure_wallet["lifetime"] -= rto_penalty
+                continue
+
+            if order_status not in ["paid", "processing", "shipped", "out_for_delivery", "delivered", "settled_override", "rto_initiated", "return_requested", "returned"]: continue
                 
             order_discount = float(order.get("discount_applied", 0))
             promo_role = order.get("promo_creator_role")
             promo_email = order.get("promo_seller_email")
             seller_bears_discount = (promo_role == "seller" and promo_email == current_seller_email)
             
-            seller_items = [i for i in order.get("items", []) if i.get("sellerEmail") == current_seller_email]
+            seller_items = [i for i in order.get("items", []) if (i.get("sellerEmail") or "").lower() == current_seller_email.lower()]
             seller_gross_total = sum(float(i.get("price", 0)) * int(i.get("quantity", 1)) for i in seller_items)
                 
             for item in seller_items:
@@ -949,10 +930,25 @@ def get_isolated_seller_data():
                     "qty": item_qty, "gross": round(discounted_item_revenue, 2), "fee": round(jamba_fee, 2), "commission_gst": round(commission_gst, 2),
                     "tcs": round(tcs_amount, 2), "net": round(net_seller_earnings, 2), "status": order_status
                 })
-                
-                if order_status in ["delivered", "settled_override"]: secure_wallet["available"] += net_seller_earnings
-                elif order_status in ["paid", "processing"]: secure_wallet["pending"] += net_seller_earnings
-                secure_wallet["lifetime"] += net_seller_earnings
+
+                if order_status in ["returned", "return_requested"]:
+                    pass
+                elif order_status in ["delivered", "settled_override"]:
+                    policy = item.get("return_policy", "7_day_return_replace")
+                    hold_days = 3 if policy == "final_sale" else 9
+                    delivered_at = order.get("delivered_at") or order.get("created_at") or ""
+                    try:
+                        delivered_ts = datetime.fromisoformat(str(delivered_at).replace("Z", "+00:00")).timestamp()
+                        if datetime.now(timezone.utc).timestamp() - (hold_days * 86400) > delivered_ts or order_status == "settled_override":
+                            secure_wallet["available"] += net_seller_earnings
+                        else:
+                            secure_wallet["pending"] += net_seller_earnings
+                    except ValueError:
+                        secure_wallet["pending"] += net_seller_earnings
+                    secure_wallet["lifetime"] += net_seller_earnings
+                elif order_status in ["paid", "processing", "shipped", "out_for_delivery", "rto_initiated"]:
+                    secure_wallet["pending"] += net_seller_earnings
+                    secure_wallet["lifetime"] += net_seller_earnings
 
         for doc in db.collection("payout_requests").where("email", "==", current_seller_email).get():
             amt = float(doc.to_dict().get("amount", 0))
@@ -992,21 +988,26 @@ def compute_available_balance(seller_email):
     raw_gst_brackets = cfg.get("gstBrackets", [{"maxLimit": 2500, "rate": 5.0}, {"maxLimit": 999999, "rate": 18.0}])
     gst_brackets = sorted(raw_gst_brackets, key=lambda x: float(x.get("maxLimit", 999999)))
     
-    hold_days = 7
-    cutoff = datetime.now(timezone.utc).timestamp() - hold_days * 86400
-    
     seller_doc = db.collection("authorized_sellers").document(seller_email).get()
     has_gst = seller_doc.to_dict().get("kycData", {}).get("hasGst", False) if seller_doc.exists else False
 
     earned = 0.0
     for o in db.collection("orders").where("sellerEmails", "array_contains", seller_email).get():
         od = o.to_dict()
-        if od.get("status") != "delivered": continue
+        status = od.get("status")
+        
+        if status == "rto_delivered":
+            earned -= 150.0  
+            continue
+
+        if status not in ["delivered", "settled_override"]: continue
+        
         delivered_at = od.get("delivered_at") or od.get("created_at") or ""
         try:
-            if datetime.fromisoformat(str(delivered_at).replace("Z", "+00:00")).timestamp() > cutoff: continue
-        except ValueError: continue
-        
+            delivered_ts = datetime.fromisoformat(str(delivered_at).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+            
         order_discount = float(od.get("discount_applied", 0))
         promo_role = od.get("promo_creator_role")
         promo_email = od.get("promo_seller_email")
@@ -1016,8 +1017,15 @@ def compute_available_balance(seller_email):
         seller_gross_total = sum(float(i.get("price", 0)) * int(i.get("quantity", 1)) for i in seller_items)
 
         for it in seller_items:
+            policy = it.get("return_policy", "7_day_return_replace")
+            hold_days = 3 if policy == "final_sale" else 9
+            cutoff = datetime.now(timezone.utc).timestamp() - hold_days * 86400
+            
+            if delivered_ts > cutoff and status != "settled_override":
+                continue 
+
             item_price = float(it.get("price", 0))
-            item_qty = int(item.get("quantity", 1))
+            item_qty = int(it.get("quantity", 1))
             gross_item_revenue = item_price * item_qty
             
             item_discount = order_discount * (gross_item_revenue / seller_gross_total) if (seller_bears_discount and seller_gross_total > 0) else 0
@@ -1040,6 +1048,7 @@ def compute_available_balance(seller_email):
             
             net_product_value = discounted_item_revenue / (1 + (product_gst_percent / 100.0))
             tcs_deduction = (net_product_value * (tcs_percent / 100.0)) if has_gst else 0.0
+            
             earned += discounted_item_revenue - jamba_fee - commission_gst - tcs_deduction
             
     withdrawn = sum([float(pd.to_dict().get("amount", 0)) for pd in db.collection("payout_requests").where("email", "==", seller_email).get() if pd.to_dict().get("status") in ("pending", "approved", "paid", "on_hold")])
@@ -1062,7 +1071,6 @@ def request_payout():
         if amount > compute_available_balance(request.seller_email): 
             return jsonify({"error": "Amount exceeds available balance"}), 400
 
-        # ATOMIC TRANSACTION TO PREVENT RACE CONDITIONS
         transaction = db.transaction()
         pending_query = db.collection("payout_requests").where("email", "==", request.seller_email).where("status", "==", "pending").limit(1)
 
