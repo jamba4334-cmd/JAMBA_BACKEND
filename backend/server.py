@@ -57,7 +57,8 @@ limiter = Limiter(
 )
 
 # CORS SETUP (Native Preflight Handling)
-ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,https://jambawear.pages.dev").split(",") if o.strip()]
+DEFAULT_ORIGINS = "http://localhost:5173,http://localhost:5174,https://jambawear.pages.dev,https://jamba-react.jamba4334.workers.dev"
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", DEFAULT_ORIGINS).split(",") if o.strip()]
 CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}},
      allow_headers=["Authorization", "Content-Type", "Idempotency-Key"], 
      methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"], 
@@ -202,9 +203,12 @@ def _verify_bearer():
     if not auth_header.startswith("Bearer "): return None
     token = auth_header[7:].strip()
     if not token or len(token) > 4096: return None
-    try: decoded = firebase_auth.verify_id_token(token, check_revoked=True)
-    except Exception: return None
-    if not decoded.get("email") or decoded.get("email_verified") is not True: return None
+    try:
+        decoded = firebase_auth.verify_id_token(token, check_revoked=True)
+    except Exception as e:
+        logger.warning(f"Token verification failed: {e}")
+        return None
+    if not decoded.get("email"): return None
     return decoded
 
 def admin_required(f):
@@ -250,20 +254,40 @@ def health(): return jsonify({"server": "running", "status": "ok"}), 200
 @app.route("/api/v1/secure/upload-signature", methods=["GET"])
 @limiter.limit("30 per minute")
 def get_upload_signature():
-    """Secure proxy for generating Cloudinary signatures without exposing API secrets."""
+    """Secure proxy for generating Cloudinary signatures with folder validation."""
     user = _verify_bearer()
     if not user: return jsonify({"error": "Unauthorized"}), 401
     
+    purpose = request.args.get("purpose", "general").strip().lower()
+    folder_map = {
+        "kyc": "jamba_kyc",
+        "review": "jamba_reviews",
+        "product": "jamba_products",
+        "storefront": "jamba_storefronts",
+        "profile": "jamba_profiles",
+        "site": "jamba_site"
+    }
+    folder = folder_map.get(purpose, "jamba_uploads")
+    
     timestamp = int(time.time())
     api_secret = os.getenv("CLOUDINARY_API_SECRET")
+    api_key = os.getenv("CLOUDINARY_API_KEY") or os.getenv("VITE_CLOUDINARY_API_KEY", "")
+    cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME") or os.getenv("VITE_CLOUDINARY_CLOUD_NAME", "dbbafwgug")
     
     if not api_secret:
         return jsonify({"error": "Storage configuration missing"}), 500
         
-    to_sign = f"timestamp={timestamp}{api_secret}"
+    # Cloudinary requires parameters in alphabetical order: folder, then timestamp
+    to_sign = f"folder={folder}&timestamp={timestamp}{api_secret}"
     signature = hashlib.sha1(to_sign.encode("utf-8")).hexdigest()
     
-    return jsonify({"signature": signature, "timestamp": timestamp}), 200
+    return jsonify({
+        "signature": signature,
+        "timestamp": timestamp,
+        "folder": folder,
+        "api_key": api_key,
+        "cloud_name": cloud_name
+    }), 200
 
 @app.route("/api/v1/public/settings/financial", methods=["GET"])
 @limiter.limit("60 per minute")
@@ -274,6 +298,19 @@ def public_financial_settings():
         return jsonify(doc.to_dict() if doc.exists else {}), 200
     except Exception as e:
         logger.error(f"Error fetching public settings: {str(e)}")
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route("/api/v1/public/settings/<setting_id>", methods=["GET"])
+@limiter.limit("60 per minute")
+def get_public_setting(setting_id):
+    """Serves public layout/banner settings such as hero_banners for Navbar.jsx."""
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    try:
+        clean_id = v_doc_id(setting_id, "setting_id")
+        doc = db.collection("settings").document(clean_id).get()
+        return jsonify(doc.to_dict() if doc.exists else {}), 200
+    except Exception as e:
+        logger.error(f"Error fetching public setting {setting_id}: {str(e)}")
         return jsonify({"error": "Internal server error"}), 500
 
 storefront_cache = {"data": {}, "timestamp": 0}
@@ -474,7 +511,6 @@ def create_order():
             "created_at": datetime.now(timezone.utc).isoformat(), "sellerEmails": list(seller_emails_set)
         }
 
-        # PHASE 4 FIX: Burn promo codes instantly for COD only.
         if total_discount > 0 and promo_data and promo_data.get("usage_limit") == "single":
             if payment_method == "COD":
                 db.collection("promocodes").document(promo_doc_id).update({"used_by": firestore.ArrayUnion([customer_email])})
@@ -517,14 +553,12 @@ def verify_payment():
         razorpay_signature = v_str(data.get("razorpay_signature"), 128, "signature")
         if not (razorpay_order_id and rose_payment_id and razorpay_signature): return jsonify({"error": "Invalid payload."}), 400
 
-        # 1. Cryptographic Signature Validation
         razorpay_client.utility.verify_payment_signature({
             "razorpay_order_id": razorpay_order_id, 
             "razorpay_payment_id": rose_payment_id, 
             "razorpay_signature": razorpay_signature
         })
         
-        # 2. Idempotency Check (Prevent duplicate processing)
         orders_ref = db.collection("orders").where("razorpay_order_id", "==", razorpay_order_id).limit(1).get()
         if not orders_ref:
             return jsonify({"error": "Order not found."}), 404
@@ -535,14 +569,12 @@ def verify_payment():
         if order_data.get("status") == "paid":
             return jsonify({"status": "Payment already verified!"}), 200
 
-        # 3. Confirm Payment Ledger Entry
         db.collection("orders").document(order_doc.id).update({
             "status": "paid", 
             "payment_id": rose_payment_id,
             "paid_at": datetime.now(timezone.utc).isoformat()
         })
 
-        # 4. Burn the Single-Use Promo Code (Only on confirmed success)
         promo_code_str = order_data.get("promo_used")
         customer_email = order_data.get("email")
         if promo_code_str and customer_email:
@@ -576,7 +608,6 @@ def generate_invoice(order_id):
         
         req_email = user.get("email", "").lower()
         
-        # 1. Authorization
         is_owner = order_data.get("userId") == user.get("uid") or (order_data.get("email") or "").lower() == req_email
         is_seller = req_email in [e.lower() for e in order_data.get("sellerEmails", [])]
         
@@ -590,7 +621,6 @@ def generate_invoice(order_id):
         if not (is_owner or is_seller or is_admin): 
             return jsonify({"error": "Unauthorized to view this invoice"}), 403
 
-        # 2. Extract Data Safely
         seller_emails = order_data.get("sellerEmails", [])
         seller_email = seller_emails[0] if seller_emails else ""
         seller_data = {}
@@ -602,7 +632,6 @@ def generate_invoice(order_id):
         has_gst = kyc_data.get("hasGst", False)
         document_title = "TAX INVOICE" if has_gst else "BILL OF SUPPLY"
         
-        # Format Data
         brand_name = seller_data.get("brandName", "Jambawear Artisan")
         seller_name = seller_data.get("sellerName", "Registered Artisan")
         seller_state = seller_data.get("pickupState", seller_data.get("state", "Assam")).strip().upper()
@@ -616,18 +645,15 @@ def generate_invoice(order_id):
         
         is_intra_state = (seller_state == customer_state)
 
-        # 3. Unicode Safe Text Wrapper
         def safe_text(text):
             return str(text).encode('latin-1', 'replace').decode('latin-1')
 
-        # 4. Initialize Professional PDF
         pdf = FPDF(orientation="P", unit="mm", format="A4")
         pdf.add_page()
         pdf.set_draw_color(200, 200, 200)
 
-        # --- Header Section ---
         pdf.set_font("Arial", 'B', 22)
-        pdf.set_text_color(139, 115, 85) # Jamba Gold/Brown
+        pdf.set_text_color(139, 115, 85)
         pdf.cell(100, 8, txt="JAMBA WEAR", ln=False, align='L')
         
         pdf.set_font("Arial", 'B', 16)
@@ -639,7 +665,6 @@ def generate_invoice(order_id):
         pdf.cell(190, 5, txt="Authentic Traditional Fashion Marketplace", ln=True, align='L')
         pdf.ln(4)
 
-        # --- ECO Compliance Banner (Section 52 CGST) ---
         pdf.set_fill_color(248, 249, 250)
         pdf.set_text_color(50, 50, 50)
         pdf.set_font("Arial", '', 8)
@@ -647,7 +672,6 @@ def generate_invoice(order_id):
         pdf.multi_cell(190, 5, txt=safe_text(eco_text), border=1, align='C', fill=True)
         pdf.ln(6)
 
-        # --- Invoice Meta Details ---
         pdf.set_font("Arial", 'B', 9)
         pdf.set_text_color(0, 0, 0)
         invoice_num = f"JW/{order_data.get('jamba_order_id', order_id)[-8:]}"
@@ -658,11 +682,10 @@ def generate_invoice(order_id):
         pdf.cell(95, 5, txt=safe_text(f"Place of Supply: {customer_state}"), ln=True, align='R')
         pdf.ln(6)
 
-        # --- Seller & Customer Addresses ---
         pdf.set_fill_color(235, 235, 235)
         pdf.set_font("Arial", 'B', 9)
         pdf.cell(92, 7, txt=" Sold By (Seller Details):", border=1, fill=True, ln=False)
-        pdf.cell(6, 7, txt="", border=0, ln=False) # Spacing
+        pdf.cell(6, 7, txt="", border=0, ln=False)
         pdf.cell(92, 7, txt=" Billed & Shipped To:", border=1, fill=True, ln=True)
 
         pdf.set_font("Arial", '', 9)
@@ -683,7 +706,6 @@ def generate_invoice(order_id):
         
         pdf.set_y(max(y_seller, y_buyer) + 8)
 
-        # --- Table Headers ---
         pdf.set_font("Arial", 'B', 8)
         pdf.set_fill_color(240, 240, 240)
         pdf.cell(10, 8, txt="#", border=1, align='C', fill=True)
@@ -694,7 +716,6 @@ def generate_invoice(order_id):
         pdf.cell(30, 8, txt="Total (Rs)", border=1, align='R', fill=True)
         pdf.ln(8)
 
-        # --- Table Body ---
         pdf.set_font("Arial", '', 8)
         
         items = order_data.get("items", [])
@@ -709,11 +730,9 @@ def generate_invoice(order_id):
             price = float(item.get('price', 0))
             gross = price * qty
             
-            # Proportional line-item discount
             item_discount = (gross / subtotal) * discount if subtotal > 0 else 0
             net_amount = max(0, gross - item_discount)
             
-            # Line item tax calculations
             if has_gst:
                 rate = 18.0 if net_amount > 2500 else 5.0
                 taxable = net_amount / (1 + (rate / 100))
@@ -752,7 +771,6 @@ def generate_invoice(order_id):
             
             pdf.set_y(y_curr + row_h)
 
-        # --- Shipping Row ---
         shipping_fee = float(order_data.get("shipping_fee", 0))
         if shipping_fee > 0:
             pdf.cell(10, 8, txt="-", border=1, align='C')
@@ -764,12 +782,10 @@ def generate_invoice(order_id):
             pdf.ln(8)
             total_taxable += shipping_fee
 
-        # --- Financial Summary & Signature ---
         pdf.ln(4)
         x_sum = 120
         y_sum = pdf.get_y()
         
-        # Left Declarations
         pdf.set_font("Arial", '', 8)
         pdf.set_text_color(100, 100, 100)
         decl = "Tax Payable on Reverse Charge: No\n\n"
@@ -777,7 +793,6 @@ def generate_invoice(order_id):
         else: decl += "Issued by an unregistered artisan under GST exemptions.\nNo GST is charged or collected."
         pdf.multi_cell(100, 4, txt=safe_text(decl))
         
-        # Right Math Summary
         pdf.set_xy(x_sum, y_sum)
         pdf.set_text_color(0, 0, 0)
         
@@ -802,19 +817,18 @@ def generate_invoice(order_id):
                 print_total_row("IGST Apportioned:", total_gst)
                 
         if discount > 0:
-            print_total_row("Total Discount:", -discount, color=(5, 150, 105)) # Green
+            print_total_row("Total Discount:", -discount, color=(5, 150, 105))
             
         pdf.set_y(pdf.get_y() + 2)
         pdf.set_x(x_sum)
-        pdf.cell(70, 0, border="T") # Top line
+        pdf.cell(70, 0, border="T")
         pdf.ln(1)
         
         print_total_row("GRAND TOTAL:", float(order_data.get('total', 0)), bold=True)
         
         pdf.set_x(x_sum)
-        pdf.cell(70, 0, border="B") # Bottom line
+        pdf.cell(70, 0, border="B")
 
-        # --- Digital Signature Footer ---
         pdf.ln(20)
         pdf.set_font("Arial", 'I', 8)
         pdf.cell(100, 4, txt="E. & O.E.", ln=False)
@@ -824,7 +838,6 @@ def generate_invoice(order_id):
         pdf.set_font("Arial", '', 8)
         pdf.cell(190, 4, txt="Authorized Signatory", ln=True, align='R')
 
-        # 5. Output PDF Bytes Safely
         pdf_out = pdf.output(dest='S')
         pdf_bytes = pdf_out.encode('latin1') if isinstance(pdf_out, str) else bytes(pdf_out)
 
@@ -1145,12 +1158,52 @@ def update_payout(payout_id):
     except Exception as e: return jsonify({"error": "Internal server error"}), 500
 
 # ==========================================
-# 8. SELLER FINANCE, PAYOUT ROUTES & ORDERS
+# 8. SELLER ONBOARDING, FINANCE & ORDERS
 # ==========================================
-@app.route("/api/v1/seller/onboarding", methods=["GET"])
-@seller_required
-def check_seller_onboarding():
-    return jsonify({"status": "approved"}), 200
+@app.route("/api/v1/seller/onboarding", methods=["GET", "POST"])
+def seller_onboarding():
+    """Handles checking status (GET) and submitting KYC applications (POST) for any authenticated user."""
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    user = _verify_bearer()
+    if not user: return jsonify({"error": "Unauthorized"}), 401
+    
+    email = user.get("email", "").lower()
+    uid = user.get("uid", "")
+    
+    if request.method == "GET":
+        # 1. Check if already an approved seller
+        if db.collection("authorized_sellers").document(email).get().exists:
+            return jsonify({"status": "approved"}), 200
+            
+        # 2. Check seller_applications by uid or email
+        app_doc = db.collection("seller_applications").document(uid).get()
+        if not app_doc.exists:
+            app_doc = db.collection("seller_applications").document(email).get()
+        if not app_doc.exists:
+            q = db.collection("seller_applications").where("email", "==", email).limit(1).get()
+            if q: app_doc = q[0]
+            
+        if app_doc and app_doc.exists:
+            app_data = app_doc.to_dict()
+            return jsonify({"status": app_data.get("status", "kyc_submitted"), "application": app_data}), 200
+            
+        return jsonify({"status": "none"}), 200
+        
+    if request.method == "POST":
+        data = request.get_json() or {}
+        now = datetime.now(timezone.utc).isoformat()
+        payload = {
+            **data,
+            "email": email,
+            "uid": uid,
+            "status": data.get("status", "kyc_submitted"),
+            "updatedAt": now
+        }
+        if "createdAt" not in payload:
+            payload["createdAt"] = now
+            
+        db.collection("seller_applications").document(uid).set(payload, merge=True)
+        return jsonify({"status": "kyc_submitted"}), 201
 
 @app.route("/api/v1/seller/profile", methods=["GET", "PUT"])
 @seller_required
@@ -1651,6 +1704,54 @@ def get_customer_orders():
     except Exception as e:
         logger.error(f"Error fetching customer orders: {str(e)}", exc_info=True)
         return jsonify({"error": "Internal server error"}), 500
+
+@app.route("/api/v1/customer/reviews", methods=["GET", "POST"])
+def manage_customer_reviews():
+    """Allows authenticated customers to fetch their own reviews (GET) and submit new reviews (POST)."""
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    user = _verify_bearer()
+    if not user: return jsonify({"error": "Unauthorized"}), 401
+    
+    uid = user.get("uid", "")
+    
+    if request.method == "GET":
+        try:
+            docs = db.collection("reviews").where("userId", "==", uid).get()
+            reviews = []
+            for d in docs:
+                r = d.to_dict()
+                r["id"] = d.id
+                if "createdAt" in r and hasattr(r["createdAt"], "isoformat"):
+                    r["createdAt"] = r["createdAt"].isoformat()
+                reviews.append(r)
+            return jsonify(reviews), 200
+        except Exception as e:
+            logger.error(f"Error fetching customer reviews: {str(e)}")
+            return jsonify({"error": "Internal server error"}), 500
+            
+    if request.method == "POST":
+        try:
+            data = request.get_json() or {}
+            review_doc = {
+                "productId": v_doc_id(data.get("productId"), "productId"),
+                "orderId": v_doc_id(data.get("orderId"), "orderId") if data.get("orderId") else "",
+                "sellerEmail": v_str(data.get("sellerEmail", ""), 190, "sellerEmail"),
+                "brandName": v_str(data.get("brandName", "JAMBAWEAR"), 100, "brandName"),
+                "sellerId": v_str(data.get("sellerId", "JAMBA_DIRECT"), 100, "sellerId"),
+                "userId": uid,
+                "userName": v_str(user.get("name") or data.get("userName") or "Jamba Customer", 100, "userName"),
+                "rating": v_int(data.get("rating", 5), 1, 5, "rating"),
+                "reviewText": v_str(data.get("reviewText", ""), 2000, "reviewText"),
+                "images": [v_str(url, 500, "image_url") for url in (data.get("images") or [])[:5]],
+                "createdAt": datetime.now(timezone.utc).isoformat()
+            }
+            _, doc_ref = db.collection("reviews").add(review_doc)
+            return jsonify({"status": "success", "id": doc_ref.id}), 201
+        except BadInput as be:
+            return jsonify({"error": str(be)}), 400
+        except Exception as e:
+            logger.error(f"Error submitting customer review: {str(e)}")
+            return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/api/v1/public/config/<doc_id>", methods=["GET"])
 @limiter.limit("60 per minute")
