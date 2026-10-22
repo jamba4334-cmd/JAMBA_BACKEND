@@ -26,6 +26,7 @@ import io
 import re
 import uuid
 
+
 # Load environment variables from the .env file
 load_dotenv()
 
@@ -1668,3 +1669,30 @@ def admin_suspend_store(email):
     suspend_status = request.get_json().get("isSuspended", True)
     db.collection("seller_profiles").document(v_email(email)).update({"storefront.isSuspended": suspend_status})
     return jsonify({"status": "success"}), 200
+
+
+# ==========================================
+# SECURE CLOUDINARY SIGNATURE PROXY
+# ==========================================
+@app.route("/api/v1/secure/upload-signature", methods=["GET"])
+def generate_upload_signature():
+    # 1. Grab the hidden secret from Render's environment
+    api_secret = os.environ.get("CLOUDINARY_API_SECRET")
+    
+    if not api_secret:
+        return jsonify({"error": "Cloudinary secret not configured on server"}), 500
+        
+    # 2. Generate a Unix timestamp for the exact moment of the request
+    timestamp = int(time.time())
+    
+    # 3. Create the exact string Cloudinary expects (parameters in alphabetical order + the secret)
+    string_to_sign = f"timestamp={timestamp}{api_secret}"
+    
+    # 4. Generate the SHA-1 hash signature
+    signature = hashlib.sha1(string_to_sign.encode('utf-8')).hexdigest()
+    
+    # 5. Return the safe signature back to the React frontend
+    return jsonify({
+        "timestamp": timestamp,
+        "signature": signature
+    }), 200
