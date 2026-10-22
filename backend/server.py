@@ -1547,3 +1547,124 @@ def master_admin_logs():
         
     logs = [{**doc.to_dict(), "id": doc.id} for doc in q.get()]
     return jsonify(logs), 200
+
+
+
+# ==========================================
+# ADMIN SUB-COMPONENT APIs
+# ==========================================
+
+# 1. SUBSCRIPTIONS
+@app.route("/api/v1/admin/subscriptions", methods=["GET"])
+@admin_required
+def admin_get_subscriptions():
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    users = db.collection("users").where("role", "==", "seller").get()
+    return jsonify([{ "id": d.id, **d.to_dict() } for d in users]), 200
+
+@app.route("/api/v1/admin/subscriptions/<user_id>", methods=["PUT"])
+@admin_required
+def admin_update_subscription(user_id):
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    db.collection("users").document(user_id).update(request.get_json())
+    return jsonify({"status": "success"}), 200
+
+# 2. TICKETS
+@app.route("/api/v1/admin/tickets", methods=["GET", "POST"])
+@admin_required
+def admin_tickets():
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    if request.method == "GET":
+        docs = db.collection("support_tickets").order_by("date", direction=firestore.Query.DESCENDING).get()
+        return jsonify([{ "id": d.id, **d.to_dict() } for d in docs]), 200
+    if request.method == "POST":
+        _, doc_ref = db.collection("support_tickets").add(request.get_json())
+        return jsonify({"id": doc_ref.id}), 201
+
+@app.route("/api/v1/admin/tickets/<ticket_id>", methods=["PUT"])
+@admin_required
+def admin_update_ticket(ticket_id):
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    db.collection("support_tickets").document(ticket_id).update(request.get_json())
+    return jsonify({"status": "success"}), 200
+
+# 3. REVIEWS
+@app.route("/api/v1/admin/reviews", methods=["GET"])
+@admin_required
+def admin_get_reviews():
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    docs = db.collection("reviews").get()
+    return jsonify([{ "id": d.id, **d.to_dict() } for d in docs]), 200
+
+@app.route("/api/v1/admin/reviews/<review_id>", methods=["DELETE"])
+@admin_required
+def admin_delete_review(review_id):
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    db.collection("reviews").document(review_id).delete()
+    return jsonify({"status": "success"}), 200
+
+# 4. SELLER APPLICATIONS
+@app.route("/api/v1/admin/seller_applications", methods=["GET"])
+@admin_required
+def admin_get_applications():
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    docs = db.collection("seller_applications").where("status", "in", ["kyc_submitted", "pending_kyc"]).get()
+    return jsonify([{ "id": d.id, **d.to_dict() } for d in docs]), 200
+
+@app.route("/api/v1/admin/seller_applications/<app_id>/<action>", methods=["POST"])
+@admin_required
+def admin_process_application(app_id, action):
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    app_ref = db.collection("seller_applications").document(app_id)
+    if action == "approve":
+        app_data = app_ref.get().to_dict()
+        db.collection("authorized_sellers").document(app_data["email"]).set({
+            "email": app_data["email"], "brandName": app_data.get("brandName", ""),
+            "ownerName": app_data.get("ownerName", ""), "phone": app_data.get("phone", ""),
+            "approvedAt": datetime.now(timezone.utc).isoformat(), "kycData": app_data.get("kycData", {})
+        })
+        app_ref.update({"status": "approved", "approvedAt": datetime.now(timezone.utc).isoformat(), "reviewedBy": request.admin_email})
+    elif action == "reject":
+        app_ref.update({"status": "rejected", "rejectedAt": datetime.now(timezone.utc).isoformat(), "reviewedBy": request.admin_email, "rejectionReason": request.get_json().get("reason", "")})
+    return jsonify({"status": "success"}), 200
+
+# 5. CATEGORIES
+@app.route("/api/v1/admin/categories", methods=["GET", "POST"])
+@admin_required
+def admin_categories():
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    if request.method == "GET":
+        docs = db.collection("categories").get()
+        return jsonify([{ "id": d.id, **d.to_dict() } for d in docs]), 200
+    if request.method == "POST":
+        data = request.get_json()
+        db.collection("categories").document(data["slug"]).set({"name": data["name"], "subcategories": data.get("subcategories", [])})
+        return jsonify({"status": "success"}), 201
+
+@app.route("/api/v1/admin/categories/<cat_id>", methods=["PUT", "DELETE"])
+@admin_required
+def admin_category_detail(cat_id):
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    cat_ref = db.collection("categories").document(cat_id)
+    if request.method == "PUT":
+        cat_ref.update(request.get_json())
+        return jsonify({"status": "success"}), 200
+    if request.method == "DELETE":
+        cat_ref.delete()
+        return jsonify({"status": "success"}), 200
+
+# 6. SELLER PROFILES (GET ALL & SUSPEND)
+@app.route("/api/v1/admin/seller_profiles", methods=["GET"])
+@admin_required
+def admin_get_all_seller_profiles():
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    docs = db.collection("seller_profiles").get()
+    return jsonify([{ "id": d.id, **d.to_dict() } for d in docs]), 200
+    
+@app.route("/api/v1/admin/seller_profiles/<email>/suspend", methods=["PUT"])
+@admin_required
+def admin_suspend_store(email):
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    suspend_status = request.get_json().get("isSuspended", True)
+    db.collection("seller_profiles").document(v_email(email)).update({"storefront.isSuspended": suspend_status})
+    return jsonify({"status": "success"}), 200
