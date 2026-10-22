@@ -5,6 +5,7 @@ import os
 import json
 import logging
 import time
+import hashlib
 from datetime import datetime, timezone
 from functools import wraps
 
@@ -40,23 +41,15 @@ logger = logging.getLogger("jambawear_api")
 
 app = Flask(__name__)
 
-# SECURITY: Rate Limiter Setup (Centralized via Redis for Horizontal Scaling)
-redis_host = os.getenv("REDIS_HOST", "localhost")
-redis_port = os.getenv("REDIS_PORT", "6379")
-redis_password = os.getenv("REDIS_PASSWORD", "")
-
-redis_protocol = "rediss" if os.getenv("REDIS_HOST") else "redis"
-redis_auth = f":{redis_password}@" if redis_password else ""
-LIMITER_URI = f"{redis_protocol}://{redis_auth}{redis_host}:{redis_port}"
-
+# SECURITY: Rate Limiter Setup (Prevents DDoS and Brute Force)
 limiter = Limiter(
     get_remote_address,
     app=app,
     default_limits=["500 per day", "100 per hour"],
-    storage_uri=LIMITER_URI
+    storage_uri=os.getenv("REDIS_URL", "memory://")
 )
 
-ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",") if o.strip()]
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,https://jambawear.pages.dev").split(",") if o.strip()]
 CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}},
      allow_headers=["Authorization", "Content-Type", "Idempotency-Key"], methods=["GET", "POST", "PUT", "DELETE"], max_age=600)
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  
@@ -109,7 +102,7 @@ def pick(data, allowed): return {k: data[k] for k in allowed if k in data}
 PRODUCT_FIELDS = ["name", "description", "selling_price", "mrp", "category", "tribe", "images",
                   "sizes", "colors", "stock", "isReturnable", "brandName", "sellerName",
                   "sellerEmail", "item_id", "status", "tags", "hsn", "weight", "approval_status"]
-ORDER_ADMIN_FIELDS = ["status", "tracking_id", "courier", "admin_note", "delivered_at", "return_status", "trackingId", "courierName", "shipping_label_url"]
+ORDER_ADMIN_FIELDS = ["status", "tracking_id", "courier", "admin_note", "delivered_at", "return_status"]
 PAYOUT_ADMIN_FIELDS = ["status", "utr", "admin_note"]
 
 @app.errorhandler(BadInput)
@@ -162,6 +155,7 @@ except Exception as e:
     logger.error(f"❌ Razorpay failed: {e}")
     razorpay_client = None
 
+# ZERO TRUST: Connect to Redis securely using TLS and authentication
 try:
     redis_client = redis.Redis(
         host=os.getenv("REDIS_HOST", "localhost"),
@@ -239,6 +233,24 @@ def optional_user(): return _verify_bearer()
 @app.route("/health", methods=["GET"])
 @limiter.exempt
 def health(): return jsonify({"server": "running", "status": "ok"}), 200
+
+@app.route("/api/v1/secure/upload-signature", methods=["GET"])
+@limiter.limit("30 per minute")
+def get_upload_signature():
+    """Secure proxy for generating Cloudinary signatures without exposing API secrets."""
+    user = _verify_bearer()
+    if not user: return jsonify({"error": "Unauthorized"}), 401
+    
+    timestamp = int(time.time())
+    api_secret = os.getenv("CLOUDINARY_API_SECRET")
+    
+    if not api_secret:
+        return jsonify({"error": "Storage configuration missing"}), 500
+        
+    to_sign = f"timestamp={timestamp}{api_secret}"
+    signature = hashlib.sha1(to_sign.encode("utf-8")).hexdigest()
+    
+    return jsonify({"signature": signature, "timestamp": timestamp}), 200
 
 @app.route("/api/v1/public/settings/financial", methods=["GET"])
 @limiter.limit("60 per minute")
@@ -573,8 +585,66 @@ def generate_invoice(order_id):
         return jsonify({"error": "Failed to generate document"}), 500
 
 # ==========================================
-# 6. ADMIN ROUTES
+# 6. ADMIN ROUTES & SESSION CONTROL
 # ==========================================
+@app.route("/api/v1/admin/session", methods=["POST", "DELETE"])
+@admin_required
+def manage_admin_session():
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    admin_email = request.admin_email
+    admin_ref = db.collection("admin_users").document(admin_email)
+    now = datetime.now(timezone.utc).isoformat()
+    
+    if request.method == "POST":
+        ip_address = get_remote_address()
+        admin_ref.set({
+            "isOnline": True,
+            "lastActive": now,
+            "lastIp": ip_address,
+            "forceLogout": False
+        }, merge=True)
+        db.collection("admin_audit_logs").add({
+            "email": admin_email,
+            "action": "LOGIN",
+            "timestamp": now,
+            "ip": ip_address,
+            "details": "Admin logged in securely."
+        })
+        return jsonify({"status": "Session started"}), 200
+        
+    elif request.method == "DELETE":
+        admin_ref.set({"isOnline": False, "lastActive": now}, merge=True)
+        db.collection("admin_audit_logs").add({
+            "email": admin_email,
+            "action": "LOGOUT",
+            "timestamp": now,
+            "ip": get_remote_address(),
+            "details": "Admin logged out."
+        })
+        return jsonify({"status": "Session ended"}), 200
+
+@app.route("/api/v1/admin/session/status", methods=["GET"])
+@admin_required
+def admin_session_status():
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    admin_email = request.admin_email
+    
+    if ALLOWED_ADMIN_EMAIL and admin_email == ALLOWED_ADMIN_EMAIL:
+        return jsonify({"isAuthorized": True, "forceLogout": False}), 200
+        
+    admin_doc = db.collection("admin_users").document(admin_email).get()
+    if not admin_doc.exists:
+        return jsonify({"isAuthorized": False, "forceLogout": True}), 403
+        
+    data = admin_doc.to_dict()
+    if data.get("forceLogout") is True or data.get("isAuthorized") is not True:
+        return jsonify({"isAuthorized": False, "forceLogout": True}), 403
+        
+    db.collection("admin_users").document(admin_email).update({
+        "lastActive": datetime.now(timezone.utc).isoformat()
+    })
+    return jsonify({"isAuthorized": True, "forceLogout": False}), 200
+
 @app.route("/admin/products", methods=["GET", "POST"])
 @admin_required
 def admin_products():
@@ -1003,6 +1073,7 @@ def get_payout_history():
     except Exception as e: return jsonify({"error": "Internal server error"}), 500
 
 def compute_available_balance(seller_email):
+    """Server-side source of truth for what a seller can withdraw."""
     cfg_doc = db.collection("settings").document("financial_settings").get()
     cfg = cfg_doc.to_dict() if cfg_doc.exists else {}
     
@@ -1214,8 +1285,10 @@ def validate_promocode():
 @app.route("/api/v1/customer/orders", methods=["GET"])
 def get_customer_orders():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
+    
     user = _verify_bearer()
     if not user: return jsonify({"error": "Unauthorized"}), 401
+    
     try:
         user_email = user.get("email", "").lower()
         user_uid = user.get("uid", "")
@@ -1231,6 +1304,7 @@ def get_customer_orders():
             
         customer_orders = list(orders_map.values())
         customer_orders.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        
         return jsonify(customer_orders), 200
     except Exception as e:
         logger.error(f"Error fetching customer orders: {str(e)}", exc_info=True)
@@ -1250,16 +1324,22 @@ def get_all_public_products():
     try:
         if redis_client:
             cached_data = redis_client.get(cache_key)
-            if cached_data: return jsonify(json.loads(cached_data)), 200
+            if cached_data:
+                return jsonify(json.loads(cached_data)), 200
+        
         if db is None: return jsonify({"error": "DB unavailable"}), 503
         docs = db.collection("products").get()
+        
         products = []
         for doc in docs:
             data = doc.to_dict()
             if not data.get("isHidden", False):
                 data["id"] = doc.id
                 products.append(data)
-        if redis_client: redis_client.setex(cache_key, 3600, json.dumps(products))
+        
+        if redis_client:
+            redis_client.setex(cache_key, 3600, json.dumps(products))
+            
         return jsonify(products), 200
     except Exception as e:
         logger.error(f"Error fetching catalog: {str(e)}")
@@ -1270,11 +1350,15 @@ def get_all_public_products():
 def get_public_product(item_id):
     clean_id = v_doc_id(item_id, "item_id")
     cache_key = f"global:products:detail:{clean_id}"
+    
     try:
         if redis_client:
             cached_data = redis_client.get(cache_key)
-            if cached_data: return jsonify(json.loads(cached_data)), 200
+            if cached_data:
+                return jsonify(json.loads(cached_data)), 200
+        
         if db is None: return jsonify({"error": "DB unavailable"}), 503
+        
         q = db.collection("products").where("item_id", "==", clean_id).limit(1).get()
         if q:
             data = q[0].to_dict()
@@ -1284,7 +1368,10 @@ def get_public_product(item_id):
             if not doc_snap.exists: return jsonify({"error": "Not found"}), 404
             data = doc_snap.to_dict()
             data["id"] = doc_snap.id
-        if redis_client: redis_client.setex(cache_key, 3600, json.dumps(data))
+            
+        if redis_client:
+            redis_client.setex(cache_key, 3600, json.dumps(data))
+            
         return jsonify(data), 200
     except Exception as e:
         logger.error(f"Error fetching product {clean_id}: {str(e)}")
@@ -1307,17 +1394,21 @@ def manage_customer_profile():
     if db is None: return jsonify({"error": "DB unavailable"}), 503
     user = _verify_bearer()
     if not user: return jsonify({"error": "Unauthorized"}), 401
+    
     doc_ref = db.collection("users").document(user["uid"])
     if request.method == "GET":
         doc_snap = doc_ref.get()
         if doc_snap.exists and (doc_snap.to_dict().get("name") or doc_snap.to_dict().get("ownerName")):
             return jsonify({"exists": True, "profile": doc_snap.to_dict()}), 200
         return jsonify({"exists": False}), 200
+        
     data = request.get_json()
     payload = {
         "name": v_str(data.get("name", user.get("name", "JAMBA Member")), 100, "name"),
         "ownerName": v_str(data.get("name", user.get("name", "JAMBA Member")), 100, "name"),
-        "email": user.get("email", ""), "role": "customer", "uid": user["uid"],
+        "email": user.get("email", ""),
+        "role": "customer",
+        "uid": user["uid"],
         "createdAt": data.get("createdAt", datetime.now(timezone.utc).isoformat())
     }
     if data.get("phone"): payload["phone"] = v_str(data["phone"], 20, "phone")
@@ -1329,6 +1420,7 @@ def manage_wishlist():
     if db is None: return jsonify({"error": "DB unavailable"}), 503
     user = _verify_bearer()
     if not user: return jsonify({"error": "Unauthorized"}), 401
+    
     if request.method == "GET":
         q = db.collection("users").document(user["uid"]).collection("wishlist").get()
         items = []
@@ -1337,12 +1429,15 @@ def manage_wishlist():
             p_snap = db.collection("products").document(pid).get()
             if p_snap.exists: items.append({**p_snap.to_dict(), "id": p_snap.id})
         return jsonify(items), 200
+        
     data = request.get_json()
     product_id = v_doc_id(data.get("productId"), "product_id")
     wishlist_ref = db.collection("users").document(user["uid"]).collection("wishlist").document(product_id)
+    
     if request.method == "POST":
         wishlist_ref.set({"productId": product_id, "addedAt": datetime.now(timezone.utc).isoformat()})
         return jsonify({"status": "success"}), 200
+        
     if request.method == "DELETE":
         wishlist_ref.delete()
         return jsonify({"status": "success"}), 200
@@ -1361,9 +1456,11 @@ def manage_cart():
     user = _verify_bearer()
     if not user: return jsonify({"error": "Unauthorized"}), 401
     cart_ref = db.collection("carts").document(user["uid"])
+    
     if request.method == "GET":
         snap = cart_ref.get()
         return jsonify(snap.to_dict().get("items", []) if snap.exists else []), 200
+        
     data = request.get_json()
     cart_ref.set({"items": data.get("items", [])}, merge=True)
     return jsonify({"status": "success"}), 200
@@ -1374,229 +1471,79 @@ def manage_addresses():
     user = _verify_bearer()
     if not user: return jsonify({"error": "Unauthorized"}), 401
     user_ref = db.collection("users").document(user["uid"])
+    
     if request.method == "GET":
         snap = user_ref.get()
         return jsonify(snap.to_dict().get("addresses", []) if snap.exists else []), 200
+        
     data = request.get_json()
     if request.method == "POST":
         user_ref.set({"addresses": data.get("addresses", [])}, merge=True)
         return jsonify({"status": "success"}), 200
 
-# ==========================================
-# 11. SELLER TICKETS API
-# ==========================================
-@app.route("/api/v1/seller/tickets", methods=["GET", "POST"])
-def seller_tickets():
-    if db is None: return jsonify({"error": "Database unavailable"}), 503
-    user = _verify_bearer()
-    if not user: return jsonify({"error": "Unauthorized"}), 401
-    try:
-        if request.method == "GET":
-            q = db.collection("support_tickets")
-            if user.get("email").lower() != ALLOWED_ADMIN_EMAIL:
-                q = q.where("email", "==", user.get("email").lower())
-            return jsonify([{**doc.to_dict(), "id": doc.id} for doc in q.get()]), 200
-        if request.method == "POST":
-            data = request.get_json()
-            doc_ref = db.collection("support_tickets").add({
-                "sellerName": data.get("sellerName", "Seller"),
-                "email": user.get("email").lower(),
-                "subject": v_str(data.get("subject", ""), 150),
-                "status": "open",
-                "date": datetime.now(timezone.utc).isoformat(),
-                "messages": data.get("messages", [])
-            })
-            return jsonify({"status": "success", "id": doc_ref[1].id}), 201
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/v1/seller/tickets/<ticket_id>/reply", methods=["POST"])
-def reply_ticket(ticket_id):
-    if db is None: return jsonify({"error": "Database unavailable"}), 503
-    user = _verify_bearer()
-    if not user: return jsonify({"error": "Unauthorized"}), 401
-    try:
-        data = request.get_json()
-        ref = db.collection("support_tickets").document(v_doc_id(ticket_id))
-        doc = ref.get()
-        if not doc.exists: return jsonify({"error": "Not found"}), 404
-        
-        tdata = doc.to_dict()
-        messages = tdata.get("messages", [])
-        messages.append(data.get("message"))
-        ref.update({"messages": messages, "status": "open"})
-        return jsonify({"status": "success"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/v1/seller/reviews", methods=["GET"])
-@seller_required
-def seller_reviews():
-    if db is None: return jsonify({"error": "Database unavailable"}), 503
-    try:
-        q = db.collection("reviews").where("sellerEmail", "==", request.seller_email).get()
-        return jsonify([{**doc.to_dict(), "id": doc.id} for doc in q]), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/v1/seller/reviews/<review_id>/reply", methods=["POST"])
-@seller_required
-def seller_review_reply(review_id):
-    if db is None: return jsonify({"error": "Database unavailable"}), 503
-    try:
-        data = request.get_json()
-        db.collection("reviews").document(v_doc_id(review_id)).update({
-            "sellerReply": v_str(data.get("replyText", ""), 500)
-        })
-        return jsonify({"status": "success"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/v1/seller/onboarding", methods=["GET", "POST"])
-def seller_onboarding():
-    if db is None: return jsonify({"error": "Database unavailable"}), 503
-    user = _verify_bearer()
-    if not user: return jsonify({"error": "Unauthorized"}), 401
-    email = user.get("email").lower()
-    
-    if request.method == "GET":
-        auth_doc = db.collection("authorized_sellers").document(email).get()
-        if auth_doc.exists: return jsonify({"status": "approved"}), 200
-        
-        apps = db.collection("seller_applications").where("email", "==", email).limit(1).get()
-        if apps:
-            return jsonify({"status": apps[0].to_dict().get("status", "pending_kyc")}), 200
-        return jsonify({"status": "not_started"}), 200
-
-    if request.method == "POST":
-        try:
-            data = request.get_json()
-            data["email"] = email
-            data["status"] = "kyc_submitted"
-            db.collection("seller_applications").add(data)
-            return jsonify({"status": "success"}), 201
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
-@app.route("/api/v1/seller/profile", methods=["GET", "PUT"])
-@seller_required
-def seller_profile_api():
-    if db is None: return jsonify({"error": "Database unavailable"}), 503
-    ref = db.collection("seller_profiles").document(request.seller_email)
-    if request.method == "GET":
-        snap = ref.get()
-        return jsonify(snap.to_dict() if snap.exists else {}), 200
-    data = request.get_json()
-    ref.set(data, merge=True)
-    return jsonify({"status": "success"}), 200
-
-@app.route("/api/v1/seller/products", methods=["GET", "POST"])
-@seller_required
-def seller_products_api():
-    if db is None: return jsonify({"error": "Database unavailable"}), 503
-    if request.method == "GET":
-        q = db.collection("products").where("sellerEmail", "==", request.seller_email).get()
-        return jsonify([{**doc.to_dict(), "id": doc.id, "docId": doc.id} for doc in q]), 200
-    if request.method == "POST":
-        data = request.get_json()
-        data["sellerEmail"] = request.seller_email
-        data["created_at"] = datetime.now(timezone.utc).isoformat()
-        _, ref = db.collection("products").add(data)
-        return jsonify({"status": "success", "id": ref.id}), 201
-
-@app.route("/api/v1/seller/products/<doc_id>", methods=["PUT", "DELETE"])
-@seller_required
-def seller_product_mutation(doc_id):
-    if db is None: return jsonify({"error": "Database unavailable"}), 503
-    ref = db.collection("products").document(v_doc_id(doc_id))
-    doc = ref.get()
-    if not doc.exists or doc.to_dict().get("sellerEmail") != request.seller_email:
-        return jsonify({"error": "Unauthorized"}), 403
-    if request.method == "PUT":
-        ref.update(request.get_json())
-        return jsonify({"status": "success"}), 200
-    if request.method == "DELETE":
-        ref.delete()
-        return jsonify({"status": "success"}), 200
-
-# ==========================================
-# 12. SECURE ADMIN SESSION MANAGEMENT
-# ==========================================
-@app.route("/api/v1/admin/session", methods=["POST", "DELETE"])
-def manage_admin_session():
-    if db is None: return jsonify({"error": "Database unavailable"}), 503
-    decoded = _verify_bearer()
-    if not decoded: return jsonify({"error": "Unauthorized"}), 401
-    email = decoded["email"].lower()
-    
-    if request.method == "POST":
-        try:
-            data = request.get_json()
-            display_name = data.get("displayName", "Admin")
-            name_parts = display_name.split(" ")
-            
-            if ALLOWED_ADMIN_EMAIL and email == ALLOWED_ADMIN_EMAIL:
-                db.collection("admin_audit_logs").add({
-                    "email": email, "action": "LOGIN", "timestamp": datetime.now(timezone.utc).isoformat()
-                })
-                return jsonify({"status": "success", "isMaster": True}), 200
-
-            admin_doc = db.collection("admin_users").document(email).get()
-            if not admin_doc.exists or not admin_doc.to_dict().get("isAuthorized"):
-                return jsonify({"error": "Unauthorized email address."}), 403
-                
-            admin_data = admin_doc.to_dict()
-            db.collection("admin_users").document(email).update({
-                "isOnline": True, "forceLogout": False,
-                "firstName": admin_data.get("firstName") if admin_data.get("firstName") != "Pending" else name_parts[0],
-                "lastName": admin_data.get("lastName") if admin_data.get("lastName") != "Registration..." else " ".join(name_parts[1:])
-            })
-            
-            db.collection("admin_audit_logs").add({
-                "email": email, "action": "LOGIN", "timestamp": datetime.now(timezone.utc).isoformat()
-            })
-            
-            return jsonify({
-                "status": "success", 
-                "maxDuration": admin_data.get("maxDuration", 60),
-                "startTime": admin_data.get("accessStartTime", "00:00"),
-                "endTime": admin_data.get("accessEndTime", "23:59")
-            }), 200
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
-    if request.method == "DELETE":
-        try:
-            if email != ALLOWED_ADMIN_EMAIL:
-                db.collection("admin_users").document(email).update({"isOnline": False})
-            db.collection("admin_audit_logs").add({
-                "email": email, "action": "LOGOUT", "timestamp": datetime.now(timezone.utc).isoformat()
-            })
-            return jsonify({"status": "success"}), 200
-        except Exception:
-            return jsonify({"status": "success"}), 200
-
-@app.route("/api/v1/admin/session/status", methods=["GET"])
-def check_admin_status():
-    if db is None: return jsonify({"error": "Database unavailable"}), 503
-    decoded = _verify_bearer()
-    if not decoded: return jsonify({"error": "Unauthorized"}), 401
-    email = decoded["email"].lower()
-    
-    if ALLOWED_ADMIN_EMAIL and email == ALLOWED_ADMIN_EMAIL:
-        return jsonify({"valid": True}), 200
-        
-    try:
-        admin_doc = db.collection("admin_users").document(email).get()
-        if not admin_doc.exists: return jsonify({"valid": False, "reason": "deleted"}), 200
-        
-        data = admin_doc.to_dict()
-        if not data.get("isAuthorized") or data.get("forceLogout"):
-            return jsonify({"valid": False, "reason": "revoked"}), 200
-            
-        return jsonify({"valid": True}), 200
-    except Exception:
-        return jsonify({"valid": True}), 200
-
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
+
+
+    # ==========================================
+# MASTER CONTROL API ROUTES
+# ==========================================
+@app.route("/api/v1/admin/users", methods=["GET", "POST"])
+@admin_required
+def master_admin_users():
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    if request.admin_email != ALLOWED_ADMIN_EMAIL:
+        return jsonify({"error": "Forbidden"}), 403
+        
+    if request.method == "GET":
+        users = [{**doc.to_dict(), "id": doc.id} for doc in db.collection("admin_users").get()]
+        return jsonify(users), 200
+        
+    if request.method == "POST":
+        data = request.get_json()
+        email = v_email(data.get("email"))
+        db.collection("admin_users").document(email).set({
+            "email": email,
+            "firstName": "Pending",
+            "lastName": "Registration...",
+            "isAuthorized": True,
+            "isOnline": False,
+            "forceLogout": False,
+            "accessStartTime": "00:00",
+            "accessEndTime": "23:59",
+            "maxDuration": 60,
+            "createdAt": datetime.now(timezone.utc).isoformat()
+        })
+        return jsonify({"status": "success"}), 201
+
+@app.route("/api/v1/admin/users/<admin_id>", methods=["PUT", "DELETE"])
+@admin_required
+def master_admin_user_detail(admin_id):
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    if request.admin_email != ALLOWED_ADMIN_EMAIL:
+        return jsonify({"error": "Forbidden"}), 403
+        
+    admin_ref = db.collection("admin_users").document(v_email(admin_id))
+    if request.method == "PUT":
+        data = request.get_json()
+        admin_ref.set(data, merge=True)
+        return jsonify({"status": "success"}), 200
+        
+    if request.method == "DELETE":
+        admin_ref.delete()
+        return jsonify({"status": "success"}), 200
+
+@app.route("/api/v1/admin/logs", methods=["GET"])
+@admin_required
+def master_admin_logs():
+    if db is None: return jsonify({"error": "Database unavailable"}), 503
+    if request.admin_email != ALLOWED_ADMIN_EMAIL:
+        return jsonify({"error": "Forbidden"}), 403
+        
+    email = request.args.get("email")
+    q = db.collection("admin_audit_logs").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(200)
+    if email:
+        q = q.where("email", "==", v_email(email))
+        
+    logs = [{**doc.to_dict(), "id": doc.id} for doc in q.get()]
+    return jsonify(logs), 200
