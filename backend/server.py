@@ -532,97 +532,255 @@ def generate_invoice(order_id):
         
         req_email = user.get("email", "").lower()
         
-        # 1. Safe Authorization Check
+        # 1. Authorization
         is_owner = order_data.get("userId") == user.get("uid") or (order_data.get("email") or "").lower() == req_email
         is_seller = req_email in [e.lower() for e in order_data.get("sellerEmails", [])]
         
         is_admin = False
         if req_email:
-            if ALLOWED_ADMIN_EMAIL and req_email == ALLOWED_ADMIN_EMAIL:
-                is_admin = True
+            if ALLOWED_ADMIN_EMAIL and req_email == ALLOWED_ADMIN_EMAIL: is_admin = True
             else:
                 admin_doc = db.collection("admin_users").document(req_email).get()
-                if admin_doc.exists and admin_doc.to_dict().get("isAuthorized") is True:
-                    is_admin = True
+                if admin_doc.exists and admin_doc.to_dict().get("isAuthorized") is True: is_admin = True
 
         if not (is_owner or is_seller or is_admin): 
             return jsonify({"error": "Unauthorized to view this invoice"}), 403
 
-        # 2. Safe Seller Data Retrieval (Prevents ValueError on empty document path)
+        # 2. Extract Data Safely
         seller_emails = order_data.get("sellerEmails", [])
         seller_email = seller_emails[0] if seller_emails else ""
         seller_data = {}
-        
         if seller_email:
             seller_doc = db.collection("authorized_sellers").document(seller_email).get()
-            if seller_doc.exists:
-                seller_data = seller_doc.to_dict()
+            if seller_doc.exists: seller_data = seller_doc.to_dict()
                 
         kyc_data = seller_data.get("kycData", {})
         has_gst = kyc_data.get("hasGst", False)
         document_title = "TAX INVOICE" if has_gst else "BILL OF SUPPLY"
         
-        # 3. Unicode Safe Text Wrapper (Prevents FPDF Character Crashes)
+        # Format Data
+        brand_name = seller_data.get("brandName", "Jambawear Artisan")
+        seller_name = seller_data.get("sellerName", "Registered Artisan")
+        seller_state = seller_data.get("pickupState", seller_data.get("state", "Assam")).strip().upper()
+        seller_gst = kyc_data.get("gstNumber", "UNREGISTERED")
+        seller_pan = kyc_data.get("panNumber", "N/A")
+        seller_address = seller_data.get("pickupAddress", seller_data.get("address", ""))
+
+        shipping = order_data.get("shippingAddress", {})
+        customer_name = shipping.get("name", order_data.get("email", "Customer"))
+        customer_state = shipping.get("state", "Assam").strip().upper()
+        
+        is_intra_state = (seller_state == customer_state)
+
+        # 3. Unicode Safe Text Wrapper
         def safe_text(text):
             return str(text).encode('latin-1', 'replace').decode('latin-1')
-        
-        # 4. FPDF Generation
-        pdf = FPDF()
+
+        # 4. Initialize Professional PDF
+        pdf = FPDF(orientation="P", unit="mm", format="A4")
         pdf.add_page()
+        pdf.set_draw_color(200, 200, 200)
+
+        # --- Header Section ---
+        pdf.set_font("Arial", 'B', 22)
+        pdf.set_text_color(139, 115, 85) # Jamba Gold/Brown
+        pdf.cell(100, 8, txt="JAMBA WEAR", ln=False, align='L')
+        
         pdf.set_font("Arial", 'B', 16)
-        pdf.cell(200, 10, txt=safe_text(document_title), ln=True, align='C')
-        pdf.set_font("Arial", size=10)
-        pdf.cell(200, 6, txt=safe_text(f"Order ID: {order_data.get('jamba_order_id', order_id)}"), ln=True, align='C')
-        pdf.cell(200, 6, txt=safe_text(f"Date: {order_data.get('created_at', '')[:10]}"), ln=True, align='C')
-        pdf.ln(10)
-
-        pdf.set_font("Arial", 'B', 10)
-        pdf.cell(100, 6, txt="Sold By:", ln=False); pdf.cell(100, 6, txt="Billed To:", ln=True)
-        pdf.set_font("Arial", size=10)
+        pdf.set_text_color(30, 30, 30)
+        pdf.cell(90, 8, txt=safe_text(document_title), ln=True, align='R')
         
-        brand_name = seller_data.get("brandName", "Jambawear Artisan")
-        customer_email = order_data.get("email", "Customer")
-        pdf.cell(100, 6, txt=safe_text(brand_name), ln=False); pdf.cell(100, 6, txt=safe_text(customer_email), ln=True)
-        
-        pdf.cell(100, 6, txt=safe_text(f"GSTIN: {kyc_data.get('gstNumber', 'UNREGISTERED')}"), ln=False)
-        
-        shipping = order_data.get("shippingAddress", {})
-        shipping_str = f"{shipping.get('city', '')}, {shipping.get('state', '')} {shipping.get('pincode', '')}"
-        pdf.cell(100, 6, txt=safe_text(shipping_str), ln=True)
-        pdf.ln(10)
+        pdf.set_font("Arial", '', 9)
+        pdf.set_text_color(100, 100, 100)
+        pdf.cell(190, 5, txt="Authentic Traditional Fashion Marketplace", ln=True, align='L')
+        pdf.ln(4)
 
-        if not has_gst:
-            pdf.set_font("Arial", 'I', 9)
-            pdf.cell(200, 6, txt="* Statutory Declaration: Issuer is an unregistered artisan. No GST is collected on this supply.", ln=True)
-            pdf.ln(5)
+        # --- ECO Compliance Banner (Section 52 CGST) ---
+        pdf.set_fill_color(248, 249, 250)
+        pdf.set_text_color(50, 50, 50)
+        pdf.set_font("Arial", '', 8)
+        eco_text = "Facilitated By: JAMBA WEAR PRIVATE LIMITED | Reg. Office: Guwahati, Assam, 781001 | GSTIN: 18AAACJ0000A1Z5\n* TCS under Section 52 of the CGST Act is discharged on this transaction."
+        pdf.multi_cell(190, 5, txt=safe_text(eco_text), border=1, align='C', fill=True)
+        pdf.ln(6)
 
-        pdf.set_font("Arial", 'B', 10)
-        pdf.cell(80, 8, txt="Item Description", border=1); pdf.cell(30, 8, txt="Qty", border=1, align='C')
-        pdf.cell(40, 8, txt="Price", border=1, align='C'); pdf.cell(40, 8, txt="Total", border=1, align='C')
+        # --- Invoice Meta Details ---
+        pdf.set_font("Arial", 'B', 9)
+        pdf.set_text_color(0, 0, 0)
+        invoice_num = f"JW/{order_data.get('jamba_order_id', order_id)[-8:]}"
+        
+        pdf.cell(95, 5, txt=safe_text(f"Invoice No: {invoice_num}"), ln=False)
+        pdf.cell(95, 5, txt=safe_text(f"Date: {order_data.get('created_at', '')[:10]}"), ln=True, align='R')
+        pdf.cell(95, 5, txt=safe_text(f"Order Ref: #{order_data.get('jamba_order_id', order_id)}"), ln=False)
+        pdf.cell(95, 5, txt=safe_text(f"Place of Supply: {customer_state}"), ln=True, align='R')
+        pdf.ln(6)
+
+        # --- Seller & Customer Addresses ---
+        pdf.set_fill_color(235, 235, 235)
+        pdf.set_font("Arial", 'B', 9)
+        pdf.cell(92, 7, txt=" Sold By (Seller Details):", border=1, fill=True, ln=False)
+        pdf.cell(6, 7, txt="", border=0, ln=False) # Spacing
+        pdf.cell(92, 7, txt=" Billed & Shipped To:", border=1, fill=True, ln=True)
+
+        pdf.set_font("Arial", '', 9)
+        
+        seller_block = f"{brand_name} (Prop: {seller_name})\n{seller_address}\nState: {seller_state}\nPAN: {seller_pan}\n"
+        seller_block += f"GSTIN: {seller_gst}" if has_gst else "GST: UNREGISTERED"
+
+        buyer_block = f"{customer_name}\n{shipping.get('address1', '')} {shipping.get('landmark', '')}\n{shipping.get('city', '')}, {customer_state} - {shipping.get('pincode', '')}\nPhone: {shipping.get('phone', 'N/A')}"
+
+        x_start = pdf.get_x()
+        y_start = pdf.get_y()
+        pdf.multi_cell(92, 5, txt=safe_text(seller_block), border=1)
+        y_seller = pdf.get_y()
+        
+        pdf.set_xy(x_start + 98, y_start)
+        pdf.multi_cell(92, 5, txt=safe_text(buyer_block), border=1)
+        y_buyer = pdf.get_y()
+        
+        pdf.set_y(max(y_seller, y_buyer) + 8)
+
+        # --- Table Headers ---
+        pdf.set_font("Arial", 'B', 8)
+        pdf.set_fill_color(240, 240, 240)
+        pdf.cell(10, 8, txt="#", border=1, align='C', fill=True)
+        pdf.cell(75, 8, txt="Item Description & HSN", border=1, align='L', fill=True)
+        pdf.cell(15, 8, txt="Qty", border=1, align='C', fill=True)
+        pdf.cell(25, 8, txt="Taxable (Rs)", border=1, align='R', fill=True)
+        pdf.cell(35, 8, txt="Tax Breakdown", border=1, align='C', fill=True)
+        pdf.cell(30, 8, txt="Total (Rs)", border=1, align='R', fill=True)
         pdf.ln(8)
 
-        pdf.set_font("Arial", size=10)
-        for item in order_data.get("items", []):
-            item_name = str(item.get("name", item.get("title", "")))[:35]
+        # --- Table Body ---
+        pdf.set_font("Arial", '', 8)
+        
+        items = order_data.get("items", [])
+        subtotal = float(order_data.get("subtotal", 0))
+        discount = float(order_data.get("discount_applied", 0))
+        total_taxable = 0.0
+        
+        for idx, item in enumerate(items):
+            item_name = str(item.get("name", item.get("title", "")))[:40]
+            hsn = item.get("hsn", "6204")
             qty = int(item.get("quantity", 1))
             price = float(item.get('price', 0))
+            gross = price * qty
             
-            pdf.cell(80, 8, txt=safe_text(item_name), border=1)
-            pdf.cell(30, 8, txt=str(qty), border=1, align='C')
-            pdf.cell(40, 8, txt=safe_text(f"Rs. {price:.2f}"), border=1, align='C')
-            pdf.cell(40, 8, txt=safe_text(f"Rs. {price * qty:.2f}"), border=1, align='C')
+            # Proportional line-item discount
+            item_discount = (gross / subtotal) * discount if subtotal > 0 else 0
+            net_amount = max(0, gross - item_discount)
+            
+            # Line item tax calculations
+            if has_gst:
+                rate = 18.0 if net_amount > 2500 else 5.0
+                taxable = net_amount / (1 + (rate / 100))
+                tax_val = net_amount - taxable
+                total_taxable += taxable
+                
+                if is_intra_state:
+                    tax_str = f"CGST: {tax_val/2:.2f}\nSGST: {tax_val/2:.2f}"
+                else:
+                    tax_str = f"IGST ({rate}%): {tax_val:.2f}"
+            else:
+                taxable = net_amount
+                total_taxable += taxable
+                tax_str = "GST: 0.00"
+
+            desc_str = f"{item_name}\nSize: {item.get('size', 'N/A')} | HSN: {hsn}"
+            lines = max(desc_str.count('\n') + 1, tax_str.count('\n') + 1)
+            row_h = lines * 5
+
+            x_curr = pdf.get_x()
+            y_curr = pdf.get_y()
+            
+            pdf.cell(10, row_h, txt=str(idx+1), border=1, align='C')
+            pdf.set_xy(x_curr + 10, y_curr)
+            pdf.multi_cell(75, 5, txt=safe_text(desc_str), border=1)
+            
+            pdf.set_xy(x_curr + 85, y_curr)
+            pdf.cell(15, row_h, txt=str(qty), border=1, align='C')
+            pdf.cell(25, row_h, txt=safe_text(f"{taxable:.2f}"), border=1, align='R')
+            
+            pdf.set_xy(x_curr + 125, y_curr)
+            pdf.multi_cell(35, row_h / (tax_str.count('\n')+1), txt=safe_text(tax_str), border=1, align='C')
+            
+            pdf.set_xy(x_curr + 160, y_curr)
+            pdf.cell(30, row_h, txt=safe_text(f"{net_amount:.2f}"), border=1, align='R')
+            
+            pdf.set_y(y_curr + row_h)
+
+        # --- Shipping Row ---
+        shipping_fee = float(order_data.get("shipping_fee", 0))
+        if shipping_fee > 0:
+            pdf.cell(10, 8, txt="-", border=1, align='C')
+            pdf.cell(75, 8, txt="Shipping & Handling (SAC: 996511)", border=1)
+            pdf.cell(15, 8, txt="1", border=1, align='C')
+            pdf.cell(25, 8, txt=safe_text(f"{shipping_fee:.2f}"), border=1, align='R')
+            pdf.cell(35, 8, txt="GST: 0.00", border=1, align='C')
+            pdf.cell(30, 8, txt=safe_text(f"{shipping_fee:.2f}"), border=1, align='R')
             pdf.ln(8)
+            total_taxable += shipping_fee
 
-        pdf.ln(5)
-        pdf.set_font("Arial", 'B', 10)
-        pdf.cell(150, 8, txt="Subtotal:", align='R'); pdf.cell(40, 8, txt=safe_text(f"Rs. {order_data.get('subtotal', 0):.2f}"), align='C', ln=True)
-        if has_gst: 
-            pdf.cell(150, 8, txt="GST Applied:", align='R'); pdf.cell(40, 8, txt=safe_text(f"Rs. {order_data.get('total_gst', 0):.2f}"), align='C', ln=True)
-        pdf.cell(150, 8, txt="Shipping:", align='R'); pdf.cell(40, 8, txt=safe_text(f"Rs. {order_data.get('shipping_fee', 0):.2f}"), align='C', ln=True)
-        pdf.set_font("Arial", 'B', 12)
-        pdf.cell(150, 10, txt="Grand Total:", align='R'); pdf.cell(40, 10, txt=safe_text(f"Rs. {order_data.get('total', 0):.2f}"), align='C', ln=True)
+        # --- Financial Summary & Signature ---
+        pdf.ln(4)
+        x_sum = 120
+        y_sum = pdf.get_y()
+        
+        # Left Declarations
+        pdf.set_font("Arial", '', 8)
+        pdf.set_text_color(100, 100, 100)
+        decl = "Tax Payable on Reverse Charge: No\n\n"
+        if has_gst: decl += "We declare that this invoice shows the actual price of\nthe goods described and that all particulars are correct."
+        else: decl += "Issued by an unregistered artisan under GST exemptions.\nNo GST is charged or collected."
+        pdf.multi_cell(100, 4, txt=safe_text(decl))
+        
+        # Right Math Summary
+        pdf.set_xy(x_sum, y_sum)
+        pdf.set_text_color(0, 0, 0)
+        
+        def print_total_row(label, val, bold=False, color=None):
+            if bold: pdf.set_font("Arial", 'B', 10)
+            else: pdf.set_font("Arial", '', 9)
+            if color: pdf.set_text_color(*color)
+            pdf.set_x(x_sum)
+            pdf.cell(40, 6, txt=label, border=0, align='L')
+            pdf.cell(30, 6, txt=safe_text(f"Rs. {val:.2f}"), border=0, align='R')
+            if color: pdf.set_text_color(0, 0, 0)
+            pdf.ln(6)
 
-        # 5. Safe Byte Encoding (Handles fpdf vs fpdf2 library differences)
+        print_total_row("Total Taxable Value:", total_taxable)
+        
+        total_gst = float(order_data.get('total_gst', 0))
+        if has_gst and total_gst > 0:
+            if is_intra_state:
+                print_total_row("CGST Apportioned:", total_gst / 2)
+                print_total_row("SGST Apportioned:", total_gst / 2)
+            else:
+                print_total_row("IGST Apportioned:", total_gst)
+                
+        if discount > 0:
+            print_total_row("Total Discount:", -discount, color=(5, 150, 105)) # Green
+            
+        pdf.set_y(pdf.get_y() + 2)
+        pdf.set_x(x_sum)
+        pdf.cell(70, 0, border="T") # Top line
+        pdf.ln(1)
+        
+        print_total_row("GRAND TOTAL:", float(order_data.get('total', 0)), bold=True)
+        
+        pdf.set_x(x_sum)
+        pdf.cell(70, 0, border="B") # Bottom line
+
+        # --- Digital Signature Footer ---
+        pdf.ln(20)
+        pdf.set_font("Arial", 'I', 8)
+        pdf.cell(100, 4, txt="E. & O.E.", ln=False)
+        pdf.set_font("Arial", 'B', 9)
+        pdf.cell(90, 4, txt=safe_text(f"For {brand_name}"), ln=True, align='R')
+        pdf.ln(8)
+        pdf.set_font("Arial", '', 8)
+        pdf.cell(190, 4, txt="Authorized Signatory", ln=True, align='R')
+
+        # 5. Output PDF Bytes Safely
         pdf_out = pdf.output(dest='S')
         pdf_bytes = pdf_out.encode('latin1') if isinstance(pdf_out, str) else bytes(pdf_out)
 
