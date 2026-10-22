@@ -26,7 +26,6 @@ import io
 import re
 import uuid
 
-
 # Load environment variables from the .env file
 load_dotenv()
 
@@ -41,6 +40,12 @@ logging.basicConfig(
 logger = logging.getLogger("jambawear_api")
 
 app = Flask(__name__)
+
+# 🔥 ZERO-TRUST FIX: Guarantee all CORS preflight checks pass instantly
+@app.before_request
+def global_preflight_bypass():
+    if request.method == "OPTIONS":
+        return jsonify({"status": "preflight ok"}), 200
 
 # SECURITY: Rate Limiter Setup (Prevents DDoS and Brute Force)
 limiter = Limiter(
@@ -894,6 +899,94 @@ def update_payout(payout_id):
 # ==========================================
 # 8. SELLER FINANCE, PAYOUT ROUTES & ORDERS
 # ==========================================
+@app.route("/api/v1/seller/onboarding", methods=["GET"])
+@seller_required
+def check_seller_onboarding():
+    return jsonify({"status": "approved"}), 200
+
+@app.route("/api/v1/seller/profile", methods=["GET", "PUT"])
+@seller_required
+def manage_seller_profile():
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    profile_ref = db.collection("seller_profiles").document(request.seller_email)
+    
+    if request.method == "GET":
+        doc = profile_ref.get()
+        return jsonify(doc.to_dict() if doc.exists else {}), 200
+        
+    if request.method == "PUT":
+        data = request.get_json()
+        data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        profile_ref.set(data, merge=True)
+        return jsonify({"status": "success"}), 200
+
+@app.route("/api/v1/seller/products", methods=["GET", "POST"])
+@seller_required
+def manage_seller_products():
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    
+    if request.method == "GET":
+        products = [{**doc.to_dict(), "id": doc.id} for doc in db.collection("products").where("sellerEmail", "==", request.seller_email).get()]
+        return jsonify(products), 200
+        
+    if request.method == "POST":
+        data = request.get_json()
+        data["sellerEmail"] = request.seller_email
+        data["created_at"] = datetime.now(timezone.utc).isoformat()
+        _, doc_ref = db.collection("products").add(data)
+        return jsonify({"status": "success", "id": doc_ref.id}), 201
+
+@app.route("/api/v1/seller/products/<product_id>", methods=["PUT"])
+@seller_required
+def update_seller_product(product_id):
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    doc_ref = db.collection("products").document(product_id)
+    if doc_ref.get().to_dict().get("sellerEmail") != request.seller_email:
+        return jsonify({"error": "Forbidden"}), 403
+    doc_ref.update(request.get_json())
+    return jsonify({"status": "success"}), 200
+
+@app.route("/api/v1/seller/reviews", methods=["GET"])
+@seller_required
+def get_seller_reviews():
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    reviews = [{**doc.to_dict(), "id": doc.id} for doc in db.collection("reviews").where("sellerEmail", "==", request.seller_email).get()]
+    return jsonify(reviews), 200
+
+@app.route("/api/v1/seller/reviews/<review_id>/reply", methods=["POST"])
+@seller_required
+def reply_seller_review(review_id):
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    db.collection("reviews").document(review_id).update({
+        "sellerReply": request.get_json().get("replyText"),
+        "repliedAt": datetime.now(timezone.utc).isoformat()
+    })
+    return jsonify({"status": "success"}), 200
+
+@app.route("/api/v1/seller/tickets", methods=["GET", "POST"])
+@seller_required
+def manage_seller_tickets():
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    
+    if request.method == "GET":
+        tickets = [{**doc.to_dict(), "id": doc.id} for doc in db.collection("support_tickets").where("sellerEmail", "==", request.seller_email).get()]
+        return jsonify(tickets), 200
+        
+    if request.method == "POST":
+        data = request.get_json()
+        data.update({"sellerEmail": request.seller_email, "status": "open", "date": datetime.now(timezone.utc).isoformat()})
+        _, doc_ref = db.collection("support_tickets").add(data)
+        return jsonify({"status": "success", "id": doc_ref.id}), 201
+
+@app.route("/api/v1/seller/tickets/<ticket_id>/reply", methods=["POST"])
+@seller_required
+def reply_seller_ticket(ticket_id):
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    db.collection("support_tickets").document(ticket_id).update({
+        "messages": firestore.ArrayUnion([request.get_json().get("message")])
+    })
+    return jsonify({"status": "success"}), 200
+
 @app.route("/api/v1/seller/orders", methods=["GET"])
 @seller_required
 def get_seller_orders():
@@ -1482,11 +1575,7 @@ def manage_addresses():
         user_ref.set({"addresses": data.get("addresses", [])}, merge=True)
         return jsonify({"status": "success"}), 200
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
-
-
-    # ==========================================
+# ==========================================
 # MASTER CONTROL API ROUTES
 # ==========================================
 @app.route("/api/v1/admin/users", methods=["GET", "POST"])
@@ -1549,12 +1638,9 @@ def master_admin_logs():
     logs = [{**doc.to_dict(), "id": doc.id} for doc in q.get()]
     return jsonify(logs), 200
 
-
-
 # ==========================================
 # ADMIN SUB-COMPONENT APIs
 # ==========================================
-
 # 1. SUBSCRIPTIONS
 @app.route("/api/v1/admin/subscriptions", methods=["GET"])
 @admin_required
@@ -1671,28 +1757,5 @@ def admin_suspend_store(email):
     return jsonify({"status": "success"}), 200
 
 
-# ==========================================
-# SECURE CLOUDINARY SIGNATURE PROXY
-# ==========================================
-@app.route("/api/v1/secure/upload-signature", methods=["GET"])
-def generate_upload_signature():
-    # 1. Grab the hidden secret from Render's environment
-    api_secret = os.environ.get("CLOUDINARY_API_SECRET")
-    
-    if not api_secret:
-        return jsonify({"error": "Cloudinary secret not configured on server"}), 500
-        
-    # 2. Generate a Unix timestamp for the exact moment of the request
-    timestamp = int(time.time())
-    
-    # 3. Create the exact string Cloudinary expects (parameters in alphabetical order + the secret)
-    string_to_sign = f"timestamp={timestamp}{api_secret}"
-    
-    # 4. Generate the SHA-1 hash signature
-    signature = hashlib.sha1(string_to_sign.encode('utf-8')).hexdigest()
-    
-    # 5. Return the safe signature back to the React frontend
-    return jsonify({
-        "timestamp": timestamp,
-        "signature": signature
-    }), 200
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
