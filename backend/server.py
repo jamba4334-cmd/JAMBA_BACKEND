@@ -2,6 +2,7 @@
 # 1. IMPORTS
 # ==========================================
 import os
+import sys
 import json
 import logging
 import time
@@ -39,13 +40,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("jambawear_api")
 
-app = Flask(__name__)
+# 🔥 FAIL-FAST STARTUP VALIDATOR
+REQUIRED_ENV_VARS = ["FIREBASE_CONFIG_JSON", "RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "CLOUDINARY_API_SECRET"]
+missing_vars = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
+if missing_vars:
+    logger.critical(f"🚨 CRITICAL STARTUP FAILURE: Missing mandatory environment variables: {', '.join(missing_vars)}")
+    # Uncomment the next line in strict production to prevent the app from starting without keys
+    # sys.exit(1) 
 
-# 🔥 ZERO-TRUST FIX: Guarantee all CORS preflight checks pass instantly
-@app.before_request
-def global_preflight_bypass():
-    if request.method == "OPTIONS":
-        return jsonify({"status": "preflight ok"}), 200
+app = Flask(__name__)
 
 # SECURITY: Rate Limiter Setup (Prevents DDoS and Brute Force)
 limiter = Limiter(
@@ -55,9 +58,14 @@ limiter = Limiter(
     storage_uri=os.getenv("REDIS_URL", "memory://")
 )
 
+# CORS SETUP (Native Preflight Handling)
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,https://jambawear.pages.dev").split(",") if o.strip()]
 CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}},
-     allow_headers=["Authorization", "Content-Type", "Idempotency-Key"], methods=["GET", "POST", "PUT", "DELETE"], max_age=600)
+     allow_headers=["Authorization", "Content-Type", "Idempotency-Key"], 
+     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"], 
+     supports_credentials=True, 
+     max_age=600)
+
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  
 
 ALLOWED_ADMIN_EMAIL = (os.getenv("ADMIN_EMAIL") or "").strip().lower()
@@ -132,17 +140,17 @@ def handle_unexpected(e):
 # ==========================================
 # 3. INITIALIZE SERVICES
 # ==========================================
-FIREBASE_CONFIG_STR = os.getenv("FIREBASE_CONFIG")
+FIREBASE_CONFIG_JSON = os.getenv("FIREBASE_CONFIG_JSON")
 try:
     if not firebase_admin._apps:
-        if FIREBASE_CONFIG_STR:
-            cred_dict = json.loads(FIREBASE_CONFIG_STR)
+        if FIREBASE_CONFIG_JSON:
+            cred_dict = json.loads(FIREBASE_CONFIG_JSON)
             cred = credentials.Certificate(cred_dict)
             firebase_admin.initialize_app(cred)
-        else: logger.error("❌ FIREBASE_CONFIG is missing.")
+            logger.info("✅ Firebase initialized successfully from Environment Variable.")
+        else: logger.error("❌ FIREBASE_CONFIG_JSON is missing.")
     if firebase_admin._apps:
         db = firestore.client()
-        logger.info("✅ Firebase initialized successfully.")
     else: db = None
 except Exception as e:
     logger.error(f"❌ Firebase initialization failed: {e}")
@@ -161,7 +169,6 @@ except Exception as e:
     logger.error(f"❌ Razorpay failed: {e}")
     razorpay_client = None
 
-# ZERO TRUST: Connect to Redis securely using TLS and authentication
 try:
     redis_client = redis.Redis(
         host=os.getenv("REDIS_HOST", "localhost"),
@@ -205,9 +212,10 @@ def _verify_bearer():
 def admin_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
+        if request.method == "OPTIONS": return "", 200
         decoded = _verify_bearer()
         if not decoded: return jsonify({"error": "Unauthorized"}), 401
-        email = decoded["email"].lower()
+        email = decoded.get("email", "").lower()
         if db is None: return jsonify({"error": "Service unavailable"}), 503
         if ALLOWED_ADMIN_EMAIL and email == ALLOWED_ADMIN_EMAIL:
             request.admin_email = email
@@ -222,10 +230,11 @@ def admin_required(f):
 def seller_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
+        if request.method == "OPTIONS": return "", 200
         decoded = _verify_bearer()
         if not decoded: return jsonify({"error": "Unauthorized"}), 401
         if db is None: return jsonify({"error": "Service unavailable"}), 503
-        email = decoded["email"].lower()
+        email = decoded.get("email", "").lower()
         if not db.collection("authorized_sellers").document(email).get().exists: return jsonify({"error": "Forbidden"}), 403
         request.seller_email = email
         return f(*args, **kwargs)
@@ -1845,7 +1854,6 @@ def master_admin_logs():
 # ==========================================
 # ADMIN SUB-COMPONENT APIs
 # ==========================================
-# 1. SUBSCRIPTIONS
 @app.route("/api/v1/admin/subscriptions", methods=["GET"])
 @admin_required
 def admin_get_subscriptions():
@@ -1860,7 +1868,6 @@ def admin_update_subscription(user_id):
     db.collection("users").document(user_id).update(request.get_json())
     return jsonify({"status": "success"}), 200
 
-# 2. TICKETS
 @app.route("/api/v1/admin/tickets", methods=["GET", "POST"])
 @admin_required
 def admin_tickets():
@@ -1879,7 +1886,6 @@ def admin_update_ticket(ticket_id):
     db.collection("support_tickets").document(ticket_id).update(request.get_json())
     return jsonify({"status": "success"}), 200
 
-# 3. REVIEWS
 @app.route("/api/v1/admin/reviews", methods=["GET"])
 @admin_required
 def admin_get_reviews():
@@ -1894,7 +1900,6 @@ def admin_delete_review(review_id):
     db.collection("reviews").document(review_id).delete()
     return jsonify({"status": "success"}), 200
 
-# 4. SELLER APPLICATIONS
 @app.route("/api/v1/admin/seller_applications", methods=["GET"])
 @admin_required
 def admin_get_applications():
@@ -1919,7 +1924,6 @@ def admin_process_application(app_id, action):
         app_ref.update({"status": "rejected", "rejectedAt": datetime.now(timezone.utc).isoformat(), "reviewedBy": request.admin_email, "rejectionReason": request.get_json().get("reason", "")})
     return jsonify({"status": "success"}), 200
 
-# 5. CATEGORIES
 @app.route("/api/v1/admin/categories", methods=["GET", "POST"])
 @admin_required
 def admin_categories():
@@ -1944,7 +1948,6 @@ def admin_category_detail(cat_id):
         cat_ref.delete()
         return jsonify({"status": "success"}), 200
 
-# 6. SELLER PROFILES (GET ALL & SUSPEND)
 @app.route("/api/v1/admin/seller_profiles", methods=["GET"])
 @admin_required
 def admin_get_all_seller_profiles():
@@ -1959,7 +1962,6 @@ def admin_suspend_store(email):
     suspend_status = request.get_json().get("isSuspended", True)
     db.collection("seller_profiles").document(v_email(email)).update({"storefront.isSuspended": suspend_status})
     return jsonify({"status": "success"}), 200
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)

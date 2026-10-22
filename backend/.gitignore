@@ -1,3 +1,20 @@
-.env
-__pycache__/
 node_modules/
+
+
+# Environment Variables
+.env
+.env.*
+.env.production
+.env.local
+
+# Private Keys & Service Accounts
+*.json.key
+firebase-key.json
+serviceAccountKey.json
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+venv/
+env/
