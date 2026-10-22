@@ -525,38 +525,70 @@ def generate_invoice(order_id):
         order_id = v_doc_id(order_id, "order id")
         user = optional_user()
         if not user: return jsonify({"error": "Unauthorized"}), 401
+        
         order_doc = db.collection("orders").document(order_id).get()
         if not order_doc.exists: return jsonify({"error": "Order not found"}), 404
         order_data = order_doc.to_dict()
-        req_email = user["email"].lower()
-        is_owner = order_data.get("userId") == user["uid"] or (order_data.get("email") or "").lower() == req_email
+        
+        req_email = user.get("email", "").lower()
+        
+        # 1. Safe Authorization Check
+        is_owner = order_data.get("userId") == user.get("uid") or (order_data.get("email") or "").lower() == req_email
         is_seller = req_email in [e.lower() for e in order_data.get("sellerEmails", [])]
-        is_admin = (ALLOWED_ADMIN_EMAIL and req_email == ALLOWED_ADMIN_EMAIL) or ((lambda d: d.exists and d.to_dict().get("isAuthorized") is True)(db.collection("admin_users").document(req_email).get()))
-        if not (is_owner or is_seller or is_admin): return jsonify({"error": "Order not found"}), 404
+        
+        is_admin = False
+        if req_email:
+            if ALLOWED_ADMIN_EMAIL and req_email == ALLOWED_ADMIN_EMAIL:
+                is_admin = True
+            else:
+                admin_doc = db.collection("admin_users").document(req_email).get()
+                if admin_doc.exists and admin_doc.to_dict().get("isAuthorized") is True:
+                    is_admin = True
 
-        seller_email = order_data.get("sellerEmails", [""])[0]
-        seller_data = db.collection("authorized_sellers").document(seller_email).get().to_dict() if db.collection("authorized_sellers").document(seller_email).get().exists else {}
+        if not (is_owner or is_seller or is_admin): 
+            return jsonify({"error": "Unauthorized to view this invoice"}), 403
+
+        # 2. Safe Seller Data Retrieval (Prevents ValueError on empty document path)
+        seller_emails = order_data.get("sellerEmails", [])
+        seller_email = seller_emails[0] if seller_emails else ""
+        seller_data = {}
+        
+        if seller_email:
+            seller_doc = db.collection("authorized_sellers").document(seller_email).get()
+            if seller_doc.exists:
+                seller_data = seller_doc.to_dict()
+                
         kyc_data = seller_data.get("kycData", {})
-
         has_gst = kyc_data.get("hasGst", False)
         document_title = "TAX INVOICE" if has_gst else "BILL OF SUPPLY"
         
+        # 3. Unicode Safe Text Wrapper (Prevents FPDF Character Crashes)
+        def safe_text(text):
+            return str(text).encode('latin-1', 'replace').decode('latin-1')
+        
+        # 4. FPDF Generation
         pdf = FPDF()
         pdf.add_page()
         pdf.set_font("Arial", 'B', 16)
-        pdf.cell(200, 10, txt=document_title, ln=True, align='C')
+        pdf.cell(200, 10, txt=safe_text(document_title), ln=True, align='C')
         pdf.set_font("Arial", size=10)
-        pdf.cell(200, 6, txt=f"Order ID: {order_data.get('jamba_order_id', order_id)}", ln=True, align='C')
-        pdf.cell(200, 6, txt=f"Date: {order_data.get('created_at', '')[:10]}", ln=True, align='C')
+        pdf.cell(200, 6, txt=safe_text(f"Order ID: {order_data.get('jamba_order_id', order_id)}"), ln=True, align='C')
+        pdf.cell(200, 6, txt=safe_text(f"Date: {order_data.get('created_at', '')[:10]}"), ln=True, align='C')
         pdf.ln(10)
 
         pdf.set_font("Arial", 'B', 10)
         pdf.cell(100, 6, txt="Sold By:", ln=False); pdf.cell(100, 6, txt="Billed To:", ln=True)
         pdf.set_font("Arial", size=10)
-        pdf.cell(100, 6, txt=seller_data.get("brandName", "Jambawear Artisan"), ln=False); pdf.cell(100, 6, txt=order_data.get("email", "Customer"), ln=True)
-        pdf.cell(100, 6, txt=f"GSTIN: {kyc_data.get('gstNumber', 'UNREGISTERED')}", ln=False)
+        
+        brand_name = seller_data.get("brandName", "Jambawear Artisan")
+        customer_email = order_data.get("email", "Customer")
+        pdf.cell(100, 6, txt=safe_text(brand_name), ln=False); pdf.cell(100, 6, txt=safe_text(customer_email), ln=True)
+        
+        pdf.cell(100, 6, txt=safe_text(f"GSTIN: {kyc_data.get('gstNumber', 'UNREGISTERED')}"), ln=False)
+        
         shipping = order_data.get("shippingAddress", {})
-        pdf.cell(100, 6, txt=f"{shipping.get('city', '')}, {shipping.get('state', '')} {shipping.get('pincode', '')}", ln=True)
+        shipping_str = f"{shipping.get('city', '')}, {shipping.get('state', '')} {shipping.get('pincode', '')}"
+        pdf.cell(100, 6, txt=safe_text(shipping_str), ln=True)
         pdf.ln(10)
 
         if not has_gst:
@@ -571,21 +603,35 @@ def generate_invoice(order_id):
 
         pdf.set_font("Arial", size=10)
         for item in order_data.get("items", []):
-            pdf.cell(80, 8, txt=str(item.get("name", item.get("title", "")))[:35], border=1)
-            pdf.cell(30, 8, txt=str(item.get("quantity", 1)), border=1, align='C')
-            pdf.cell(40, 8, txt=f"Rs. {float(item.get('price', 0)):.2f}", border=1, align='C')
-            pdf.cell(40, 8, txt=f"Rs. {float(item.get('price', 0)) * int(item.get('quantity', 1)):.2f}", border=1, align='C')
+            item_name = str(item.get("name", item.get("title", "")))[:35]
+            qty = int(item.get("quantity", 1))
+            price = float(item.get('price', 0))
+            
+            pdf.cell(80, 8, txt=safe_text(item_name), border=1)
+            pdf.cell(30, 8, txt=str(qty), border=1, align='C')
+            pdf.cell(40, 8, txt=safe_text(f"Rs. {price:.2f}"), border=1, align='C')
+            pdf.cell(40, 8, txt=safe_text(f"Rs. {price * qty:.2f}"), border=1, align='C')
             pdf.ln(8)
 
         pdf.ln(5)
         pdf.set_font("Arial", 'B', 10)
-        pdf.cell(150, 8, txt="Subtotal:", align='R'); pdf.cell(40, 8, txt=f"Rs. {order_data.get('subtotal', 0):.2f}", align='C', ln=True)
-        if has_gst: pdf.cell(150, 8, txt="GST Applied:", align='R'); pdf.cell(40, 8, txt=f"Rs. {order_data.get('total_gst', 0):.2f}", align='C', ln=True)
-        pdf.cell(150, 8, txt="Shipping:", align='R'); pdf.cell(40, 8, txt=f"Rs. {order_data.get('shipping_fee', 0):.2f}", align='C', ln=True)
+        pdf.cell(150, 8, txt="Subtotal:", align='R'); pdf.cell(40, 8, txt=safe_text(f"Rs. {order_data.get('subtotal', 0):.2f}"), align='C', ln=True)
+        if has_gst: 
+            pdf.cell(150, 8, txt="GST Applied:", align='R'); pdf.cell(40, 8, txt=safe_text(f"Rs. {order_data.get('total_gst', 0):.2f}"), align='C', ln=True)
+        pdf.cell(150, 8, txt="Shipping:", align='R'); pdf.cell(40, 8, txt=safe_text(f"Rs. {order_data.get('shipping_fee', 0):.2f}"), align='C', ln=True)
         pdf.set_font("Arial", 'B', 12)
-        pdf.cell(150, 10, txt="Grand Total:", align='R'); pdf.cell(40, 10, txt=f"Rs. {order_data.get('total', 0):.2f}", align='C', ln=True)
+        pdf.cell(150, 10, txt="Grand Total:", align='R'); pdf.cell(40, 10, txt=safe_text(f"Rs. {order_data.get('total', 0):.2f}"), align='C', ln=True)
 
-        return send_file(io.BytesIO(pdf.output(dest='S').encode('latin1')), mimetype='application/pdf', as_attachment=True, download_name=f"Invoice_{order_id}.pdf")
+        # 5. Safe Byte Encoding (Handles fpdf vs fpdf2 library differences)
+        pdf_out = pdf.output(dest='S')
+        pdf_bytes = pdf_out.encode('latin1') if isinstance(pdf_out, str) else bytes(pdf_out)
+
+        return send_file(
+            io.BytesIO(pdf_bytes), 
+            mimetype='application/pdf', 
+            as_attachment=False, 
+            download_name=f"Invoice_{order_id}.pdf"
+        )
     except Exception as e:
         logger.error(f"Invoice failed: {str(e)}", exc_info=True)
         return jsonify({"error": "Failed to generate document"}), 500
