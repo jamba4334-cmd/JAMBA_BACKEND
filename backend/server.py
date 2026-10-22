@@ -40,13 +40,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("jambawear_api")
 
-# 🔥 FAIL-FAST STARTUP VALIDATOR
+# FAIL-FAST STARTUP VALIDATOR
 REQUIRED_ENV_VARS = ["FIREBASE_CONFIG_JSON", "RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "CLOUDINARY_API_SECRET"]
 missing_vars = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
 if missing_vars:
     logger.critical(f"🚨 CRITICAL STARTUP FAILURE: Missing mandatory environment variables: {', '.join(missing_vars)}")
-    # Uncomment the next line in strict production to prevent the app from starting without keys
-    # sys.exit(1) 
 
 app = Flask(__name__)
 
@@ -476,8 +474,10 @@ def create_order():
             "created_at": datetime.now(timezone.utc).isoformat(), "sellerEmails": list(seller_emails_set)
         }
 
+        # PHASE 4 FIX: Burn promo codes instantly for COD only.
         if total_discount > 0 and promo_data and promo_data.get("usage_limit") == "single":
-            db.collection("promocodes").document(promo_doc_id).update({"used_by": firestore.ArrayUnion([customer_email])})
+            if payment_method == "COD":
+                db.collection("promocodes").document(promo_doc_id).update({"used_by": firestore.ArrayUnion([customer_email])})
 
         response_payload = {}
 
@@ -517,12 +517,47 @@ def verify_payment():
         razorpay_signature = v_str(data.get("razorpay_signature"), 128, "signature")
         if not (razorpay_order_id and rose_payment_id and razorpay_signature): return jsonify({"error": "Invalid payload."}), 400
 
-        razorpay_client.utility.verify_payment_signature({"razorpay_order_id": razorpay_order_id, "razorpay_payment_id": rose_payment_id, "razorpay_signature": razorpay_signature})
+        # 1. Cryptographic Signature Validation
+        razorpay_client.utility.verify_payment_signature({
+            "razorpay_order_id": razorpay_order_id, 
+            "razorpay_payment_id": rose_payment_id, 
+            "razorpay_signature": razorpay_signature
+        })
+        
+        # 2. Idempotency Check (Prevent duplicate processing)
         orders_ref = db.collection("orders").where("razorpay_order_id", "==", razorpay_order_id).limit(1).get()
-        if len(orders_ref) > 0:
-            db.collection("orders").document(orders_ref[0].id).update({"status": "paid", "payment_id": rose_payment_id})
+        if not orders_ref:
+            return jsonify({"error": "Order not found."}), 404
+            
+        order_doc = orders_ref[0]
+        order_data = order_doc.to_dict()
+        
+        if order_data.get("status") == "paid":
+            return jsonify({"status": "Payment already verified!"}), 200
+
+        # 3. Confirm Payment Ledger Entry
+        db.collection("orders").document(order_doc.id).update({
+            "status": "paid", 
+            "payment_id": rose_payment_id,
+            "paid_at": datetime.now(timezone.utc).isoformat()
+        })
+
+        # 4. Burn the Single-Use Promo Code (Only on confirmed success)
+        promo_code_str = order_data.get("promo_used")
+        customer_email = order_data.get("email")
+        if promo_code_str and customer_email:
+            promo_query = db.collection("promocodes").where("code", "==", promo_code_str).limit(1).get()
+            if promo_query:
+                promo_doc = promo_query[0]
+                if promo_doc.to_dict().get("usage_limit") == "single":
+                    db.collection("promocodes").document(promo_doc.id).update({
+                        "used_by": firestore.ArrayUnion([customer_email])
+                    })
+                    
         return jsonify({"status": "Payment verified and saved!"}), 200
-    except razorpay.errors.SignatureVerificationError: return jsonify({"error": "Invalid signature."}), 400
+        
+    except razorpay.errors.SignatureVerificationError: 
+        return jsonify({"error": "Invalid signature."}), 400
     except Exception as e:
         logger.error(f"Error in verify_payment: {str(e)}", exc_info=True)
         return jsonify({"error": "Internal server error."}), 500
