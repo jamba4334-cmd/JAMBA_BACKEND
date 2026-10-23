@@ -1240,6 +1240,125 @@ def update_seller_product(product_id):
     doc_ref.update(request.get_json())
     return jsonify({"status": "success"}), 200
 
+@app.route("/api/v1/seller/reviews", methods=["GET"])
+@seller_required
+def get_seller_reviews():
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    try:
+        reviews = []
+        for doc in db.collection("reviews").where("sellerEmail", "==", request.seller_email).get():
+            r = doc.to_dict()
+            r["id"] = doc.id
+            if "createdAt" in r and hasattr(r["createdAt"], "isoformat"):
+                r["createdAt"] = r["createdAt"].isoformat()
+            reviews.append(r)
+        return jsonify(reviews), 200
+    except Exception as e:
+        logger.error(f"Error fetching seller reviews: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route("/api/v1/seller/reviews/<review_id>/reply", methods=["POST"])
+@seller_required
+def reply_seller_review(review_id):
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    try:
+        data = request.get_json() or {}
+        db.collection("reviews").document(v_doc_id(review_id)).update({
+            "sellerReply": v_str(data.get("replyText", ""), 1000, "replyText"),
+            "repliedAt": datetime.now(timezone.utc).isoformat()
+        })
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        logger.error(f"Error replying to review: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route("/api/v1/seller/tickets", methods=["GET", "POST"])
+@seller_required
+def manage_seller_tickets():
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    
+    if request.method == "GET":
+        try:
+            # Fetch tickets for this specific seller AND broadcasts sent to 'all'
+            own_docs = db.collection("support_tickets").where("sellerEmail", "==", request.seller_email).get()
+            broadcast_docs = db.collection("support_tickets").where("sellerEmail", "==", "all").get()
+            
+            tickets_map = {}
+            for doc in list(own_docs) + list(broadcast_docs):
+                t = doc.to_dict()
+                t["id"] = doc.id
+                # Ensure date and messages are always safe for frontend .map() and sorting
+                if "date" in t and hasattr(t["date"], "isoformat"):
+                    t["date"] = t["date"].isoformat()
+                elif "date" not in t:
+                    t["date"] = datetime.now(timezone.utc).isoformat()
+                if not isinstance(t.get("messages"), list):
+                    t["messages"] = []
+                tickets_map[doc.id] = t
+                
+            tickets = list(tickets_map.values())
+            tickets.sort(key=lambda x: str(x.get("date", "")), reverse=True)
+            return jsonify(tickets), 200
+        except Exception as e:
+            logger.error(f"Error fetching seller tickets: {str(e)}", exc_info=True)
+            return jsonify({"error": "Internal server error"}), 500
+            
+    if request.method == "POST":
+        try:
+            data = request.get_json() or {}
+            now = datetime.now(timezone.utc).isoformat()
+            
+            incoming_messages = data.get("messages", [])
+            if isinstance(incoming_messages, list) and len(incoming_messages) > 0 and isinstance(incoming_messages[0], dict):
+                message_text = incoming_messages[0].get("text", "")
+            else:
+                message_text = data.get("message", "")
+
+            new_ticket = {
+                "sellerEmail": request.seller_email,
+                "email": request.seller_email, # Kept for backward compatibility with Admin UI
+                "sellerName": v_str(data.get("sellerName", request.seller_email), 150, "sellerName"),
+                "subject": v_str(data.get("subject", "General Support"), 200, "subject"),
+                "status": "open",
+                "date": now,
+                "messages": [
+                    {
+                        "sender": "seller",
+                        "text": v_str(message_text, 2000, "message"),
+                        "time": now
+                    }
+                ]
+            }
+            _, doc_ref = db.collection("support_tickets").add(new_ticket)
+            return jsonify({"id": doc_ref.id, "status": "success"}), 201
+        except Exception as e:
+            logger.error(f"Error creating seller ticket: {str(e)}", exc_info=True)
+            return jsonify({"error": "Internal server error"}), 500
+
+@app.route("/api/v1/seller/tickets/<ticket_id>/reply", methods=["POST"])
+@seller_required
+def reply_seller_ticket(ticket_id):
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    try:
+        data = request.get_json() or {}
+        msg_obj = data.get("message", {})
+        msg_text = msg_obj.get("text", "") if isinstance(msg_obj, dict) else str(msg_obj)
+        
+        reply_entry = {
+            "sender": "seller",
+            "text": v_str(msg_text, 2000, "message"),
+            "time": datetime.now(timezone.utc).isoformat()
+        }
+        
+        db.collection("support_tickets").document(v_doc_id(ticket_id)).update({
+            "messages": firestore.ArrayUnion([reply_entry]),
+            "status": "open"
+        })
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        logger.error(f"Error replying to ticket {ticket_id}: {str(e)}", exc_info=True)
+        return jsonify({"error": "Internal server error"}), 500
+
 @app.route("/api/v1/seller/orders", methods=["GET"])
 @seller_required
 def get_seller_orders():
@@ -2052,37 +2171,3 @@ def admin_suspend_store(email):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
-
-
-# ==========================================
-# 11. SELLER SUPPORT TICKETS (NEW ROUTE)
-# ==========================================
-@app.route("/api/v1/seller/tickets", methods=["POST"])
-@seller_required
-def create_seller_ticket():
-    if db is None: return jsonify({"error": "DB unavailable"}), 503
-    
-    data = request.get_json()
-    
-    # Extract the text from the incoming array if it exists, otherwise default to empty string
-    incoming_messages = data.get("messages", [])
-    message_text = incoming_messages[0].get("text", "") if incoming_messages else data.get("message", "")
-
-    # MUST structure messages as an array so the frontend .map() function doesn't crash
-    new_ticket = {
-        "sellerEmail": request.seller_email, 
-        "sellerName": data.get("sellerName", request.seller_email),
-        "subject": data.get("subject", "General Support"),
-        "status": "open",
-        "date": datetime.now(timezone.utc).isoformat(),
-        "messages": [
-            {
-                "sender": "seller",
-                "text": message_text,
-                "time": datetime.now(timezone.utc).isoformat()
-            }
-        ]
-    }
-    
-    _, doc_ref = db.collection("support_tickets").add(new_ticket)
-    return jsonify({"id": doc_ref.id, "status": "success"}), 201
