@@ -1157,7 +1157,7 @@ def update_payout(payout_id):
 # ==========================================
 @app.route("/api/v1/seller/onboarding", methods=["GET", "POST"])
 def seller_onboarding():
-    """Handles checking status (GET) and submitting KYC applications (POST) for any authenticated user."""
+    """Handles checking status (GET) and submitting KYC applications (POST)"""
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     user = _verify_bearer()
     if not user: return jsonify({"error": "Unauthorized"}), 401
@@ -1185,11 +1185,25 @@ def seller_onboarding():
     if request.method == "POST":
         data = request.get_json() or {}
         now = datetime.now(timezone.utc).isoformat()
+        
+        # Check if the user is already blacklisted before accepting submission
+        app_doc = db.collection("seller_applications").document(uid).get()
+        if not app_doc.exists:
+            app_doc = db.collection("seller_applications").document(email).get()
+            
+        rejection_count = 0
+        if app_doc and app_doc.exists:
+            app_data = app_doc.to_dict()
+            if app_data.get("status") == "blacklisted":
+                return jsonify({"error": "Account blacklisted due to multiple rejections."}), 403
+            rejection_count = app_data.get("rejectionCount", 0)
+
         payload = {
             **data,
             "email": email,
             "uid": uid,
             "status": data.get("status", "kyc_submitted"),
+            "rejectionCount": rejection_count,
             "updatedAt": now
         }
         if "createdAt" not in payload:
@@ -2118,6 +2132,7 @@ def admin_get_applications():
 def admin_process_application(app_id, action):
     if db is None: return jsonify({"error": "DB unavailable"}), 503
     app_ref = db.collection("seller_applications").document(app_id)
+    
     if action == "approve":
         app_data = app_ref.get().to_dict()
         db.collection("authorized_sellers").document(app_data["email"]).set({
@@ -2126,8 +2141,21 @@ def admin_process_application(app_id, action):
             "approvedAt": datetime.now(timezone.utc).isoformat(), "kycData": app_data.get("kycData", {})
         })
         app_ref.update({"status": "approved", "approvedAt": datetime.now(timezone.utc).isoformat(), "reviewedBy": request.admin_email})
+        
     elif action == "reject":
-        app_ref.update({"status": "rejected", "rejectedAt": datetime.now(timezone.utc).isoformat(), "reviewedBy": request.admin_email, "rejectionReason": request.get_json().get("reason", "")})
+        app_data = app_ref.get().to_dict()
+        new_rejection_count = app_data.get("rejectionCount", 0) + 1
+        
+        # 5 Strikes and you're blacklisted logic
+        new_status = "blacklisted" if new_rejection_count >= 5 else "rejected"
+        
+        app_ref.update({
+            "status": new_status,
+            "rejectionCount": new_rejection_count,
+            "rejectedAt": datetime.now(timezone.utc).isoformat(),
+            "reviewedBy": request.admin_email,
+            "rejectionReason": request.get_json().get("reason", "")
+        })
     return jsonify({"status": "success"}), 200
 
 @app.route("/api/v1/admin/categories", methods=["GET", "POST"])
