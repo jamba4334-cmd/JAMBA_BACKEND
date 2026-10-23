@@ -1227,6 +1227,39 @@ def mark_congrats_seen():
             
     return jsonify({"status": "success"}), 200
 
+# 🔥 RESTORED ROUTES FOR SELLER DASHBOARD
+@app.route("/api/v1/seller/profile", methods=["GET", "PUT"])
+@seller_required
+def manage_seller_profile():
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    profile_ref = db.collection("seller_profiles").document(request.seller_email)
+    
+    if request.method == "GET":
+        doc = profile_ref.get()
+        return jsonify(doc.to_dict() if doc.exists else {}), 200
+        
+    if request.method == "PUT":
+        data = request.get_json()
+        data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        profile_ref.set(data, merge=True)
+        return jsonify({"status": "success"}), 200
+
+@app.route("/api/v1/seller/products", methods=["GET", "POST"])
+@seller_required
+def manage_seller_products():
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    
+    if request.method == "GET":
+        products = [{**doc.to_dict(), "id": doc.id} for doc in db.collection("products").where("sellerEmail", "==", request.seller_email).get()]
+        return jsonify(products), 200
+        
+    if request.method == "POST":
+        data = request.get_json()
+        data["sellerEmail"] = request.seller_email
+        data["created_at"] = datetime.now(timezone.utc).isoformat()
+        _, doc_ref = db.collection("products").add(data)
+        return jsonify({"status": "success", "id": doc_ref.id}), 201
+# 🔥 END RESTORED ROUTES
 
 @app.route("/api/v1/seller/products/<product_id>", methods=["PUT"])
 @seller_required
