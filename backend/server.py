@@ -1166,8 +1166,13 @@ def seller_onboarding():
     uid = user.get("uid", "")
     
     if request.method == "GET":
-        if db.collection("authorized_sellers").document(email).get().exists:
-            return jsonify({"status": "approved"}), 200
+        seller_doc = db.collection("authorized_sellers").document(email).get()
+        if seller_doc.exists:
+            # 🔥 Now we check the database to see if they've already seen the screen
+            return jsonify({
+                "status": "approved", 
+                "hasSeenCongrats": seller_doc.to_dict().get("hasSeenCongrats", False)
+            }), 200
             
         app_doc = db.collection("seller_applications").document(uid).get()
         if not app_doc.exists:
@@ -1186,7 +1191,6 @@ def seller_onboarding():
         data = request.get_json() or {}
         now = datetime.now(timezone.utc).isoformat()
         
-        # Check if the user is already blacklisted before accepting submission
         app_doc = db.collection("seller_applications").document(uid).get()
         if not app_doc.exists:
             app_doc = db.collection("seller_applications").document(email).get()
@@ -1199,12 +1203,9 @@ def seller_onboarding():
             rejection_count = app_data.get("rejectionCount", 0)
 
         payload = {
-            **data,
-            "email": email,
-            "uid": uid,
+            **data, "email": email, "uid": uid,
             "status": data.get("status", "kyc_submitted"),
-            "rejectionCount": rejection_count,
-            "updatedAt": now
+            "rejectionCount": rejection_count, "updatedAt": now
         }
         if "createdAt" not in payload:
             payload["createdAt"] = now
@@ -1212,37 +1213,20 @@ def seller_onboarding():
         db.collection("seller_applications").document(uid).set(payload, merge=True)
         return jsonify({"status": "kyc_submitted"}), 201
 
-@app.route("/api/v1/seller/profile", methods=["GET", "PUT"])
-@seller_required
-def manage_seller_profile():
-    if db is None: return jsonify({"error": "DB unavailable"}), 503
-    profile_ref = db.collection("seller_profiles").document(request.seller_email)
+@app.route("/api/v1/seller/mark_congrats", methods=["POST"])
+def mark_congrats_seen():
+    """Permanently marks the congratulations screen as seen for this seller."""
+    user = _verify_bearer()
+    if not user: return jsonify({"error": "Unauthorized"}), 401
+    email = user.get("email", "").lower()
     
-    if request.method == "GET":
-        doc = profile_ref.get()
-        return jsonify(doc.to_dict() if doc.exists else {}), 200
-        
-    if request.method == "PUT":
-        data = request.get_json()
-        data["updated_at"] = datetime.now(timezone.utc).isoformat()
-        profile_ref.set(data, merge=True)
-        return jsonify({"status": "success"}), 200
+    if db is not None:
+        doc_ref = db.collection("authorized_sellers").document(email)
+        if doc_ref.get().exists:
+            doc_ref.update({"hasSeenCongrats": True})
+            
+    return jsonify({"status": "success"}), 200
 
-@app.route("/api/v1/seller/products", methods=["GET", "POST"])
-@seller_required
-def manage_seller_products():
-    if db is None: return jsonify({"error": "DB unavailable"}), 503
-    
-    if request.method == "GET":
-        products = [{**doc.to_dict(), "id": doc.id} for doc in db.collection("products").where("sellerEmail", "==", request.seller_email).get()]
-        return jsonify(products), 200
-        
-    if request.method == "POST":
-        data = request.get_json()
-        data["sellerEmail"] = request.seller_email
-        data["created_at"] = datetime.now(timezone.utc).isoformat()
-        _, doc_ref = db.collection("products").add(data)
-        return jsonify({"status": "success", "id": doc_ref.id}), 201
 
 @app.route("/api/v1/seller/products/<product_id>", methods=["PUT"])
 @seller_required
