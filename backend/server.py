@@ -40,12 +40,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("jambawear_api")
 
-# FAIL-FAST STARTUP VALIDATOR
-REQUIRED_ENV_VARS = ["FIREBASE_CONFIG_JSON", "RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "CLOUDINARY_API_SECRET"]
-missing_vars = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
-if missing_vars:
-    logger.critical(f"🚨 CRITICAL STARTUP FAILURE: Missing mandatory environment variables: {', '.join(missing_vars)}")
-
 app = Flask(__name__)
 
 # SECURITY: Rate Limiter Setup (Prevents DDoS and Brute Force)
@@ -139,7 +133,8 @@ def handle_unexpected(e):
 # ==========================================
 # 3. INITIALIZE SERVICES
 # ==========================================
-FIREBASE_CONFIG_JSON = os.getenv("FIREBASE_CONFIG_JSON")
+# Look for either environment variable to prevent Render crashes
+FIREBASE_CONFIG_JSON = os.getenv("FIREBASE_CONFIG") or os.getenv("FIREBASE_CONFIG_JSON")
 try:
     if not firebase_admin._apps:
         if FIREBASE_CONFIG_JSON:
@@ -1171,11 +1166,9 @@ def seller_onboarding():
     uid = user.get("uid", "")
     
     if request.method == "GET":
-        # 1. Check if already an approved seller
         if db.collection("authorized_sellers").document(email).get().exists:
             return jsonify({"status": "approved"}), 200
             
-        # 2. Check seller_applications by uid or email
         app_doc = db.collection("seller_applications").document(uid).get()
         if not app_doc.exists:
             app_doc = db.collection("seller_applications").document(email).get()
@@ -1245,47 +1238,6 @@ def update_seller_product(product_id):
     if doc_ref.get().to_dict().get("sellerEmail") != request.seller_email:
         return jsonify({"error": "Forbidden"}), 403
     doc_ref.update(request.get_json())
-    return jsonify({"status": "success"}), 200
-
-@app.route("/api/v1/seller/reviews", methods=["GET"])
-@seller_required
-def get_seller_reviews():
-    if db is None: return jsonify({"error": "DB unavailable"}), 503
-    reviews = [{**doc.to_dict(), "id": doc.id} for doc in db.collection("reviews").where("sellerEmail", "==", request.seller_email).get()]
-    return jsonify(reviews), 200
-
-@app.route("/api/v1/seller/reviews/<review_id>/reply", methods=["POST"])
-@seller_required
-def reply_seller_review(review_id):
-    if db is None: return jsonify({"error": "DB unavailable"}), 503
-    db.collection("reviews").document(review_id).update({
-        "sellerReply": request.get_json().get("replyText"),
-        "repliedAt": datetime.now(timezone.utc).isoformat()
-    })
-    return jsonify({"status": "success"}), 200
-
-@app.route("/api/v1/seller/tickets", methods=["GET", "POST"])
-@seller_required
-def manage_seller_tickets():
-    if db is None: return jsonify({"error": "DB unavailable"}), 503
-    
-    if request.method == "GET":
-        tickets = [{**doc.to_dict(), "id": doc.id} for doc in db.collection("support_tickets").where("sellerEmail", "==", request.seller_email).get()]
-        return jsonify(tickets), 200
-        
-    if request.method == "POST":
-        data = request.get_json()
-        data.update({"sellerEmail": request.seller_email, "status": "open", "date": datetime.now(timezone.utc).isoformat()})
-        _, doc_ref = db.collection("support_tickets").add(data)
-        return jsonify({"status": "success", "id": doc_ref.id}), 201
-
-@app.route("/api/v1/seller/tickets/<ticket_id>/reply", methods=["POST"])
-@seller_required
-def reply_seller_ticket(ticket_id):
-    if db is None: return jsonify({"error": "DB unavailable"}), 503
-    db.collection("support_tickets").document(ticket_id).update({
-        "messages": firestore.ArrayUnion([request.get_json().get("message")])
-    })
     return jsonify({"status": "success"}), 200
 
 @app.route("/api/v1/seller/orders", methods=["GET"])
@@ -1707,7 +1659,6 @@ def get_customer_orders():
 
 @app.route("/api/v1/customer/reviews", methods=["GET", "POST"])
 def manage_customer_reviews():
-    """Allows authenticated customers to fetch their own reviews (GET) and submit new reviews (POST)."""
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     user = _verify_bearer()
     if not user: return jsonify({"error": "Unauthorized"}), 401
@@ -2101,3 +2052,37 @@ def admin_suspend_store(email):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
+
+
+# ==========================================
+# 11. SELLER SUPPORT TICKETS (NEW ROUTE)
+# ==========================================
+@app.route("/api/v1/seller/tickets", methods=["POST"])
+@seller_required
+def create_seller_ticket():
+    if db is None: return jsonify({"error": "DB unavailable"}), 503
+    
+    data = request.get_json()
+    
+    # Extract the text from the incoming array if it exists, otherwise default to empty string
+    incoming_messages = data.get("messages", [])
+    message_text = incoming_messages[0].get("text", "") if incoming_messages else data.get("message", "")
+
+    # MUST structure messages as an array so the frontend .map() function doesn't crash
+    new_ticket = {
+        "sellerEmail": request.seller_email, 
+        "sellerName": data.get("sellerName", request.seller_email),
+        "subject": data.get("subject", "General Support"),
+        "status": "open",
+        "date": datetime.now(timezone.utc).isoformat(),
+        "messages": [
+            {
+                "sender": "seller",
+                "text": message_text,
+                "time": datetime.now(timezone.utc).isoformat()
+            }
+        ]
+    }
+    
+    _, doc_ref = db.collection("support_tickets").add(new_ticket)
+    return jsonify({"id": doc_ref.id, "status": "success"}), 201
