@@ -26,6 +26,7 @@ from fpdf import FPDF
 import io
 import re
 import uuid
+import requests as http_requests
 
 # Load environment variables from the .env file
 load_dotenv()
@@ -59,7 +60,7 @@ CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}},
      supports_credentials=True, 
      max_age=600)
 
-app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  
+app.config["MAX_CONTENT_LENGTH"] = 6 * 1024 * 1024  # 6 MB ceiling (avatar endpoint enforces 5 MB itself)
 
 ALLOWED_ADMIN_EMAIL = (os.getenv("ADMIN_EMAIL") or "").strip().lower()
 
@@ -339,6 +340,85 @@ def get_upload_signature():
         "api_key": api_key,
         "cloud_name": cloud_name
     }), 200
+
+@app.route("/api/v1/admin/upload/avatar", methods=["POST"])
+@limiter.limit("20 per minute")
+@admin_required
+def admin_upload_avatar():
+    """
+    Upload an employee profile photo to Supabase Storage.
+    - Admin-only (Firebase token required)
+    - Accepts: PNG, JPG, JPEG
+    - Max size: 5 MB (enforced server-side)
+    - Returns: { url: "<public supabase url>" }
+    """
+    ALLOWED_MIME = {"image/png", "image/jpeg", "image/jpg"}
+    ALLOWED_EXT  = {".png", ".jpg", ".jpeg"}
+    MAX_BYTES    = 5 * 1024 * 1024  # 5 MB
+
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded. Use multipart/form-data with field name 'file'."}), 400
+
+    file = request.files["file"]
+    if not file or file.filename == "":
+        return jsonify({"error": "Empty file received."}), 400
+
+    # Validate MIME type
+    mime = file.mimetype or ""
+    if mime not in ALLOWED_MIME:
+        return jsonify({"error": "Only PNG, JPG and JPEG images are allowed."}), 415
+
+    # Validate extension
+    _, ext = os.path.splitext(file.filename.lower())
+    if ext not in ALLOWED_EXT:
+        return jsonify({"error": "Only .png, .jpg and .jpeg files are allowed."}), 415
+
+    # Read and check size
+    data = file.read()
+    if len(data) > MAX_BYTES:
+        return jsonify({"error": "File exceeds the 5 MB limit."}), 413
+
+    # Build a unique path inside the bucket
+    unique_name = f"{uuid.uuid4().hex}{ext}"
+    file_path   = f"avatars/{unique_name}"
+
+    supabase_url    = os.getenv("SUPABASE_URL", "").rstrip("/")
+    service_key     = os.getenv("SUPABASE_SERVICE_KEY", "")
+    bucket          = os.getenv("SUPABASE_AVATAR_BUCKET", "admin-photos")
+
+    if not supabase_url or not service_key:
+        logger.error("Supabase env vars missing — SUPABASE_URL or SUPABASE_SERVICE_KEY not set.")
+        return jsonify({"error": "Storage not configured on server."}), 500
+
+    upload_url = f"{supabase_url}/storage/v1/object/{bucket}/{file_path}"
+    headers = {
+        "Authorization": f"Bearer {service_key}",
+        "Content-Type": mime,
+        "x-upsert": "true",          # overwrite if same path (won't happen with uuid, but safe)
+    }
+
+    try:
+        resp = http_requests.put(upload_url, data=data, headers=headers, timeout=20)
+    except Exception as exc:
+        logger.error("Supabase upload network error: %s", exc)
+        return jsonify({"error": "Upload failed — network error."}), 502
+
+    if resp.status_code not in (200, 201):
+        logger.error("Supabase upload error %s: %s", resp.status_code, resp.text)
+        return jsonify({"error": "Upload failed — storage rejected the file."}), 502
+
+    # Build the public URL (bucket must be public in Supabase dashboard)
+    public_url = f"{supabase_url}/storage/v1/object/public/{bucket}/{file_path}"
+
+    log_admin_action(
+        "AVATAR_UPLOAD",
+        {"file_path": file_path, "size_bytes": len(data)},
+        target_type="avatar",
+        target_id=file_path
+    )
+
+    return jsonify({"url": public_url}), 200
+
 
 @app.route("/api/v1/public/settings/financial", methods=["GET"])
 @limiter.limit("60 per minute")
