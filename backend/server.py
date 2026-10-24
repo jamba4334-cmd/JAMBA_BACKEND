@@ -108,7 +108,8 @@ def pick(data, allowed): return {k: data[k] for k in allowed if k in data}
 
 PRODUCT_FIELDS = ["name", "description", "selling_price", "mrp", "category", "tribe", "images",
                   "sizes", "colors", "stock", "isReturnable", "brandName", "sellerName",
-                  "sellerEmail", "item_id", "status", "tags", "hsn", "weight", "approval_status"]
+                  "sellerEmail", "item_id", "status", "tags", "hsn", "weight", "approval_status",
+                  "isHidden", "isOutOfStock", "isDeleted", "blocked_reason"]
 ORDER_ADMIN_FIELDS = ["status", "tracking_id", "courier", "admin_note", "delivered_at", "return_status"]
 PAYOUT_ADMIN_FIELDS = ["status", "utr", "admin_note"]
 
@@ -920,7 +921,19 @@ def admin_products():
         try:
             data = pick(request.get_json(), PRODUCT_FIELDS)
             if "selling_price" in data: data["selling_price"] = v_float(data["selling_price"], 1, 1_000_000, "price")
-            data.update({"created_at": datetime.now(timezone.utc).isoformat(), "created_by": request.admin_email})
+            
+            now = datetime.now(timezone.utc).isoformat()
+            data.update({
+                "created_at": now, 
+                "created_by": request.admin_email,
+                "audit_history": [{
+                    "action": "created",
+                    "timestamp": now,
+                    "actor_role": "admin",
+                    "actor_id": request.admin_email,
+                    "details": "Product uploaded by admin"
+                }]
+            })
             _, doc_ref = db.collection("products").add(data)
             return jsonify({"status": "success", "id": doc_ref.id}), 201
         except Exception as e: return jsonify({"error": "Internal server error"}), 500
@@ -935,8 +948,40 @@ def admin_product_detail(doc_id):
             data = pick(request.get_json(), PRODUCT_FIELDS)
             if "selling_price" in data: data["selling_price"] = v_float(data["selling_price"], 1, 1_000_000, "price")
             if not data: return jsonify({"error": "No valid fields"}), 400
-            doc_ref.update(data)
+            
+            action = "edited"
+            details = "Admin updated product details"
+            reason = data.get("blocked_reason")
+
+            if "isDeleted" in data:
+                action = "soft_delete" if data["isDeleted"] else "restore"
+                details = f"Admin {'archived' if data['isDeleted'] else 'restored'} the product"
+            elif data.get("approval_status") == "blocked":
+                action = "blocked"
+                details = "Admin blocked the product"
+            elif data.get("approval_status") == "approved":
+                action = "approved"
+                details = "Admin approved the product"
+            elif "isHidden" in data:
+                action = "edited"
+                details = f"Admin made product {'hidden' if data['isHidden'] else 'visible'}"
+            elif "isOutOfStock" in data:
+                action = "edited"
+                details = f"Admin marked product as {'Out of Stock' if data['isOutOfStock'] else 'In Stock'}"
+
+            audit_entry = {
+                "action": action,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "actor_role": "admin",
+                "actor_id": request.admin_email,
+                "details": details
+            }
+            if reason: audit_entry["reason"] = reason
+
+            update_payload = {**data, "audit_history": firestore.ArrayUnion([audit_entry])}
+            doc_ref.update(update_payload)
             return jsonify({"status": "success"}), 200
+            
         if request.method == "DELETE":
             doc_ref.delete()
             return jsonify({"status": "success"}), 200
@@ -1168,7 +1213,6 @@ def seller_onboarding():
     if request.method == "GET":
         seller_doc = db.collection("authorized_sellers").document(email).get()
         if seller_doc.exists:
-            # 🔥 Now we check the database to see if they've already seen the screen
             return jsonify({
                 "status": "approved", 
                 "hasSeenCongrats": seller_doc.to_dict().get("hasSeenCongrats", False)
@@ -1227,7 +1271,6 @@ def mark_congrats_seen():
             
     return jsonify({"status": "success"}), 200
 
-# 🔥 RESTORED ROUTES FOR SELLER DASHBOARD
 @app.route("/api/v1/seller/profile", methods=["GET", "PUT"])
 @seller_required
 def manage_seller_profile():
@@ -1255,11 +1298,21 @@ def manage_seller_products():
         
     if request.method == "POST":
         data = request.get_json()
+        now = datetime.now(timezone.utc).isoformat()
         data["sellerEmail"] = request.seller_email
-        data["created_at"] = datetime.now(timezone.utc).isoformat()
+        data["created_at"] = now
+        
+        # 🔥 Generate Initial Audit Event 🔥
+        data["audit_history"] = [{
+            "action": "created",
+            "timestamp": now,
+            "actor_role": "seller",
+            "actor_id": request.seller_email,
+            "details": "Product uploaded to marketplace"
+        }]
+        
         _, doc_ref = db.collection("products").add(data)
         return jsonify({"status": "success", "id": doc_ref.id}), 201
-# 🔥 END RESTORED ROUTES
 
 @app.route("/api/v1/seller/products/<product_id>", methods=["PUT"])
 @seller_required
@@ -1268,7 +1321,37 @@ def update_seller_product(product_id):
     doc_ref = db.collection("products").document(product_id)
     if doc_ref.get().to_dict().get("sellerEmail") != request.seller_email:
         return jsonify({"error": "Forbidden"}), 403
-    doc_ref.update(request.get_json())
+        
+    data = request.get_json()
+    
+    # SECURITY FIX: Prevent sellers from unblocking their own products via the API
+    data.pop("approval_status", None)
+    data.pop("blocked_reason", None)
+    
+    # 🔥 Generate Audit Event 🔥
+    action = "edited"
+    details = "Seller updated product details"
+    
+    if "isDeleted" in data:
+        action = "soft_delete" if data["isDeleted"] else "restore"
+        details = f"Seller {'archived' if data['isDeleted'] else 'restored'} the product"
+    elif "isHidden" in data:
+        action = "edited"
+        details = f"Seller made product {'hidden' if data['isHidden'] else 'visible'}"
+    elif "isOutOfStock" in data:
+        action = "edited"
+        details = f"Seller marked product as {'Out of Stock' if data['isOutOfStock'] else 'In Stock'}"
+
+    audit_entry = {
+        "action": action,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "actor_role": "seller",
+        "actor_id": request.seller_email,
+        "details": details
+    }
+
+    update_payload = {**data, "audit_history": firestore.ArrayUnion([audit_entry])}
+    doc_ref.update(update_payload)
     return jsonify({"status": "success"}), 200
 
 @app.route("/api/v1/seller/reviews", methods=["GET"])
@@ -1310,7 +1393,6 @@ def manage_seller_tickets():
     
     if request.method == "GET":
         try:
-            # Fetch tickets for this specific seller AND broadcasts sent to 'all'
             own_docs = db.collection("support_tickets").where("sellerEmail", "==", request.seller_email).get()
             broadcast_docs = db.collection("support_tickets").where("sellerEmail", "==", "all").get()
             
@@ -1318,7 +1400,6 @@ def manage_seller_tickets():
             for doc in list(own_docs) + list(broadcast_docs):
                 t = doc.to_dict()
                 t["id"] = doc.id
-                # Ensure date and messages are always safe for frontend .map() and sorting
                 if "date" in t and hasattr(t["date"], "isoformat"):
                     t["date"] = t["date"].isoformat()
                 elif "date" not in t:
@@ -1347,7 +1428,7 @@ def manage_seller_tickets():
 
             new_ticket = {
                 "sellerEmail": request.seller_email,
-                "email": request.seller_email, # Kept for backward compatibility with Admin UI
+                "email": request.seller_email,
                 "sellerName": v_str(data.get("sellerName", request.seller_email), 150, "sellerName"),
                 "subject": v_str(data.get("subject", "General Support"), 200, "subject"),
                 "status": "open",
