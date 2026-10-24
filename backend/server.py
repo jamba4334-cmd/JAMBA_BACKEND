@@ -217,13 +217,68 @@ def admin_required(f):
         if db is None: return jsonify({"error": "Service unavailable"}), 503
         if ALLOWED_ADMIN_EMAIL and email == ALLOWED_ADMIN_EMAIL:
             request.admin_email = email
+            request.is_master = True
+            request.admin_profile = {"name": "Master Admin", "employeeId": "JB-MASTER-001", "role": "Super Admin", "department": "Headquarters"}
             return f(*args, **kwargs)
         admin_doc = db.collection("admin_users").document(email).get()
         if admin_doc.exists and admin_doc.to_dict().get("isAuthorized") is True:
             request.admin_email = email
+            request.is_master = False
+            request.admin_profile = admin_doc.to_dict()
             return f(*args, **kwargs)
         return jsonify({"error": "Forbidden"}), 403
     return decorated_function
+
+def log_admin_action(action, details, target_type=None, target_id=None, reason=None):
+    """Universal Audit Logger for Master Control History."""
+    if db is None: return
+    try:
+        email = getattr(request, "admin_email", "system")
+        is_master = getattr(request, "is_master", False)
+        profile = getattr(request, "admin_profile", None)
+        
+        if is_master:
+            name = "Master Admin"
+            emp_id = "JB-MASTER-001"
+            role = "Super Admin"
+            dept = "Headquarters"
+        elif profile:
+            name = profile.get("name") or f"{profile.get('firstName', '')} {profile.get('lastName', '')}".strip() or email
+            emp_id = profile.get("employeeId", "JB-EMP-000")
+            role = profile.get("role", "Admin")
+            dept = profile.get("department", "Operations")
+        else:
+            doc = db.collection("admin_users").document(email).get()
+            if doc.exists:
+                d = doc.to_dict()
+                name = d.get("name") or f"{d.get('firstName', '')} {d.get('lastName', '')}".strip() or email
+                emp_id = d.get("employeeId", "JB-EMP-000")
+                role = d.get("role", "Admin")
+                dept = d.get("department", "Operations")
+            else:
+                name = email
+                emp_id = "JB-EMP-000"
+                role = "Admin"
+                dept = "Operations"
+
+        entry = {
+            "email": email,
+            "name": name,
+            "employeeId": emp_id,
+            "role": role,
+            "department": dept,
+            "action": action,
+            "details": details,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "ip": get_remote_address()
+        }
+        if target_type: entry["target_type"] = target_type
+        if target_id: entry["target_id"] = str(target_id)
+        if reason: entry["reason"] = str(reason)
+        
+        db.collection("admin_audit_logs").add(entry)
+    except Exception as e:
+        logger.error(f"Error logging admin action: {e}")
 
 def seller_required(f):
     @wraps(f)
@@ -866,25 +921,30 @@ def manage_admin_session():
             "lastIp": ip_address,
             "forceLogout": False
         }, merge=True)
-        db.collection("admin_audit_logs").add({
-            "email": admin_email,
-            "action": "LOGIN",
-            "timestamp": now,
-            "ip": ip_address,
-            "details": "Admin logged in securely."
-        })
-        return jsonify({"status": "Session started"}), 200
+        log_admin_action("LOGIN", "Employee logged in securely")
+        return jsonify({"status": "Session started", "isMaster": getattr(request, "is_master", False)}), 200
         
     elif request.method == "DELETE":
         admin_ref.set({"isOnline": False, "lastActive": now}, merge=True)
-        db.collection("admin_audit_logs").add({
-            "email": admin_email,
-            "action": "LOGOUT",
-            "timestamp": now,
-            "ip": get_remote_address(),
-            "details": "Admin logged out."
-        })
+        log_admin_action("LOGOUT", "Employee logged out")
         return jsonify({"status": "Session ended"}), 200
+
+ALL_ADMIN_TABS = {
+    "live-products": True,
+    "approvals": True,
+    "add-product": True,
+    "tribe-settings": True,
+    "orders": True,
+    "seller-access": True,
+    "subscriptions": True,
+    "finance": True,
+    "promocodes": True,
+    "messages": True,
+    "site-settings": True,
+    "customer-details": True,
+    "store-reviews": True,
+    "master-control": True
+}
 
 @app.route("/api/v1/admin/session/status", methods=["GET"])
 @admin_required
@@ -893,7 +953,23 @@ def admin_session_status():
     admin_email = request.admin_email
     
     if ALLOWED_ADMIN_EMAIL and admin_email == ALLOWED_ADMIN_EMAIL:
-        return jsonify({"isAuthorized": True, "forceLogout": False}), 200
+        master_doc = db.collection("admin_users").document(admin_email).get()
+        master_data = master_doc.to_dict() if master_doc.exists else {}
+        return jsonify({
+            "isAuthorized": True,
+            "forceLogout": False,
+            "isMaster": True,
+            "employeeId": master_data.get("employeeId", "JB-MASTER-001"),
+            "name": master_data.get("name", "Master Admin"),
+            "gender": master_data.get("gender", "Not Specified"),
+            "role": master_data.get("role", "Super Admin"),
+            "department": master_data.get("department", "Executive"),
+            "phone": master_data.get("phone", ""),
+            "whatsapp": master_data.get("whatsapp", ""),
+            "avatarUrl": master_data.get("avatarUrl", ""),
+            "joiningDate": master_data.get("joiningDate", "2026-01-01"),
+            "permissions": ALL_ADMIN_TABS
+        }), 200
         
     admin_doc = db.collection("admin_users").document(admin_email).get()
     if not admin_doc.exists:
@@ -906,7 +982,43 @@ def admin_session_status():
     db.collection("admin_users").document(admin_email).update({
         "lastActive": datetime.now(timezone.utc).isoformat()
     })
-    return jsonify({"isAuthorized": True, "forceLogout": False}), 200
+    
+    emp_perms = data.get("permissions")
+    if not isinstance(emp_perms, dict):
+        emp_perms = {
+            "live-products": True,
+            "approvals": True,
+            "add-product": True,
+            "tribe-settings": False,
+            "orders": True,
+            "seller-access": False,
+            "subscriptions": False,
+            "finance": False,
+            "promocodes": False,
+            "messages": True,
+            "site-settings": False,
+            "customer-details": True,
+            "store-reviews": True,
+            "master-control": False
+        }
+    else:
+        emp_perms = {**emp_perms, "master-control": False}
+
+    return jsonify({
+        "isAuthorized": True,
+        "forceLogout": False,
+        "isMaster": False,
+        "employeeId": data.get("employeeId", "JB-EMP-001"),
+        "name": data.get("name") or f"{data.get('firstName', '')} {data.get('lastName', '')}".strip() or admin_email,
+        "gender": data.get("gender", "Not Specified"),
+        "role": data.get("role", "Admin"),
+        "department": data.get("department", "Operations"),
+        "phone": data.get("phone", ""),
+        "whatsapp": data.get("whatsapp", ""),
+        "avatarUrl": data.get("avatarUrl", ""),
+        "joiningDate": data.get("joiningDate", data.get("createdAt", "")[:10] if data.get("createdAt") else "2026-10-24"),
+        "permissions": emp_perms
+    }), 200
 
 @app.route("/admin/products", methods=["GET", "POST"])
 @admin_required
@@ -949,25 +1061,28 @@ def admin_product_detail(doc_id):
             if "selling_price" in data: data["selling_price"] = v_float(data["selling_price"], 1, 1_000_000, "price")
             if not data: return jsonify({"error": "No valid fields"}), 400
             
+            prod_snap = doc_ref.get()
+            prod_title = (prod_snap.to_dict().get("title") or prod_snap.to_dict().get("name") or doc_id) if prod_snap.exists else doc_id
+            
             action = "edited"
-            details = "Admin updated product details"
+            details = f"Admin updated product details for '{prod_title}'"
             reason = data.get("blocked_reason")
 
             if "isDeleted" in data:
                 action = "soft_delete" if data["isDeleted"] else "restore"
-                details = f"Admin {'archived' if data['isDeleted'] else 'restored'} the product"
+                details = f"Admin {'archived' if data['isDeleted'] else 'restored'} product '{prod_title}'"
             elif data.get("approval_status") == "blocked":
                 action = "blocked"
-                details = "Admin blocked the product"
+                details = f"Admin blocked product '{prod_title}'"
             elif data.get("approval_status") == "approved":
                 action = "approved"
-                details = "Admin approved the product"
+                details = f"Admin approved product '{prod_title}'"
             elif "isHidden" in data:
                 action = "edited"
-                details = f"Admin made product {'hidden' if data['isHidden'] else 'visible'}"
+                details = f"Admin set product '{prod_title}' to {'Hidden' if data['isHidden'] else 'Visible'}"
             elif "isOutOfStock" in data:
                 action = "edited"
-                details = f"Admin marked product as {'Out of Stock' if data['isOutOfStock'] else 'In Stock'}"
+                details = f"Admin set product '{prod_title}' to {'Out of Stock' if data['isOutOfStock'] else 'In Stock'}"
 
             audit_entry = {
                 "action": action,
@@ -980,10 +1095,14 @@ def admin_product_detail(doc_id):
 
             update_payload = {**data, "audit_history": firestore.ArrayUnion([audit_entry])}
             doc_ref.update(update_payload)
+            
+            # Mirror to Master Control global audit logs
+            log_admin_action(f"PRODUCT_{action.upper()}", details, target_type="product", target_id=doc_id, reason=reason)
             return jsonify({"status": "success"}), 200
             
         if request.method == "DELETE":
             doc_ref.delete()
+            log_admin_action("PRODUCT_DELETE", f"Permanently deleted product ID {doc_id}", target_type="product", target_id=doc_id)
             return jsonify({"status": "success"}), 200
     except Exception as e: return jsonify({"error": "Internal server error"}), 500
 
@@ -1004,6 +1123,11 @@ def update_order(order_id):
         if not data: return jsonify({"error": "No valid fields"}), 400
         data["updated_by"] = request.admin_email
         db.collection("orders").document(v_doc_id(order_id)).update(data)
+        
+        status_txt = data.get("status") or "status"
+        tracking_txt = f" (Tracking: {data.get('tracking_id')})" if data.get('tracking_id') else ""
+        log_admin_action("ORDER_UPDATE", f"Updated Order #{order_id} to '{status_txt}'{tracking_txt}", target_type="order", target_id=order_id)
+        
         return jsonify({"status": "success"}), 200
     except Exception as e: return jsonify({"error": "Internal server error"}), 500
 
@@ -2104,6 +2228,25 @@ def manage_addresses():
 # ==========================================
 # MASTER CONTROL API ROUTES
 # ==========================================
+def generate_next_employee_id():
+    """Generates sequential employee ID: JB-EMP-001, JB-EMP-002, etc."""
+    if db is None:
+        return "JB-EMP-001"
+    try:
+        docs = db.collection("admin_users").get()
+        max_num = 0
+        for doc in docs:
+            data = doc.to_dict()
+            emp_id = data.get("employeeId", "")
+            if emp_id and emp_id.startswith("JB-EMP-"):
+                num_part = emp_id.replace("JB-EMP-", "").strip()
+                if num_part.isdigit():
+                    max_num = max(max_num, int(num_part))
+        return f"JB-EMP-{max_num + 1:03d}"
+    except Exception as e:
+        logger.error(f"Error generating employee ID: {e}")
+        return "JB-EMP-001"
+
 @app.route("/api/v1/admin/users", methods=["GET", "POST"])
 @admin_required
 def master_admin_users():
@@ -2116,21 +2259,65 @@ def master_admin_users():
         return jsonify(users), 200
         
     if request.method == "POST":
-        data = request.get_json()
+        data = request.get_json() or {}
         email = v_email(data.get("email"))
-        db.collection("admin_users").document(email).set({
+        
+        existing_doc = db.collection("admin_users").document(email).get()
+        existing_data = existing_doc.to_dict() if existing_doc.exists else {}
+        
+        emp_id = existing_data.get("employeeId") or generate_next_employee_id()
+        name = data.get("name") or data.get("fullName") or f"{data.get('firstName', '')} {data.get('lastName', '')}".strip() or email.split("@")[0]
+        
+        default_permissions = {
+            "live-products": True,
+            "approvals": True,
+            "add-product": True,
+            "tribe-settings": False,
+            "orders": True,
+            "seller-access": False,
+            "subscriptions": False,
+            "finance": False,
+            "promocodes": False,
+            "messages": True,
+            "site-settings": False,
+            "customer-details": True,
+            "store-reviews": True,
+            "master-control": False
+        }
+        permissions = data.get("permissions") if isinstance(data.get("permissions"), dict) else default_permissions
+        permissions["master-control"] = False
+
+        doc_data = {
             "email": email,
-            "firstName": "Pending",
-            "lastName": "Registration...",
-            "isAuthorized": True,
+            "name": name,
+            "employeeId": emp_id,
+            "gender": data.get("gender", "Not Specified"),
+            "role": data.get("role", "Operations Admin"),
+            "department": data.get("department", "Operations"),
+            "phone": data.get("phone", ""),
+            "whatsapp": data.get("whatsapp", ""),
+            "avatarUrl": data.get("avatarUrl", ""),
+            "joiningDate": data.get("joiningDate") or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "permissions": permissions,
+            "isAuthorized": data.get("isAuthorized", True),
             "isOnline": False,
             "forceLogout": False,
-            "accessStartTime": "00:00",
-            "accessEndTime": "23:59",
-            "maxDuration": 60,
-            "createdAt": datetime.now(timezone.utc).isoformat()
-        })
-        return jsonify({"status": "success"}), 201
+            "accessStartTime": data.get("accessStartTime", "00:00"),
+            "accessEndTime": data.get("accessEndTime", "23:59"),
+            "maxDuration": data.get("maxDuration", 60),
+            "createdAt": existing_data.get("createdAt") or datetime.now(timezone.utc).isoformat(),
+            "updatedAt": datetime.now(timezone.utc).isoformat()
+        }
+        
+        db.collection("admin_users").document(email).set(doc_data, merge=True)
+        
+        log_admin_action(
+            action="EMPLOYEE_CREATE",
+            details=f"Onboarded employee {name} ({emp_id}) with department '{doc_data['department']}' and role '{doc_data['role']}'.",
+            target_type="employee",
+            target_id=email
+        )
+        return jsonify({"status": "success", "employee": doc_data}), 201
 
 @app.route("/api/v1/admin/users/<admin_id>", methods=["PUT", "DELETE"])
 @admin_required
@@ -2141,12 +2328,35 @@ def master_admin_user_detail(admin_id):
         
     admin_ref = db.collection("admin_users").document(v_email(admin_id))
     if request.method == "PUT":
-        data = request.get_json()
+        data = request.get_json() or {}
+        if "permissions" in data and isinstance(data["permissions"], dict):
+            data["permissions"]["master-control"] = False
+        data["updatedAt"] = datetime.now(timezone.utc).isoformat()
         admin_ref.set(data, merge=True)
+        
+        target_name = data.get("name") or admin_id
+        action_type = "ACCESS_UPDATE" if "permissions" in data else "EMPLOYEE_UPDATE"
+        details = f"Updated access permissions for {target_name}" if "permissions" in data else f"Updated employee profile for {target_name}"
+        log_admin_action(
+            action=action_type,
+            details=details,
+            target_type="employee",
+            target_id=admin_id
+        )
         return jsonify({"status": "success"}), 200
         
     if request.method == "DELETE":
+        doc_snap = admin_ref.get()
+        doc_data = doc_snap.to_dict() if doc_snap.exists else {}
+        emp_name = doc_data.get("name") or admin_id
+        emp_id = doc_data.get("employeeId", "")
         admin_ref.delete()
+        log_admin_action(
+            action="EMPLOYEE_DELETE",
+            details=f"Revoked all access and removed employee {emp_name} ({emp_id}).",
+            target_type="employee",
+            target_id=admin_id
+        )
         return jsonify({"status": "success"}), 200
 
 @app.route("/api/v1/admin/logs", methods=["GET"])
@@ -2234,6 +2444,12 @@ def admin_process_application(app_id, action):
             "approvedAt": datetime.now(timezone.utc).isoformat(), "kycData": app_data.get("kycData", {})
         })
         app_ref.update({"status": "approved", "approvedAt": datetime.now(timezone.utc).isoformat(), "reviewedBy": request.admin_email})
+        log_admin_action(
+            action="SELLER_APPROVAL",
+            details=f"Approved seller application for {app_data.get('brandName', app_data.get('email'))}",
+            target_type="seller_application",
+            target_id=app_id
+        )
         
     elif action == "reject":
         app_data = app_ref.get().to_dict()
@@ -2242,13 +2458,21 @@ def admin_process_application(app_id, action):
         # 5 Strikes and you're blacklisted logic
         new_status = "blacklisted" if new_rejection_count >= 5 else "rejected"
         
+        reason = (request.get_json() or {}).get("reason", "")
         app_ref.update({
             "status": new_status,
             "rejectionCount": new_rejection_count,
             "rejectedAt": datetime.now(timezone.utc).isoformat(),
             "reviewedBy": request.admin_email,
-            "rejectionReason": request.get_json().get("reason", "")
+            "rejectionReason": reason
         })
+        log_admin_action(
+            action="SELLER_REJECTION",
+            details=f"Rejected seller application for {app_data.get('brandName', app_data.get('email'))} ({new_status})",
+            target_type="seller_application",
+            target_id=app_id,
+            reason=reason
+        )
     return jsonify({"status": "success"}), 200
 
 @app.route("/api/v1/admin/categories", methods=["GET", "POST"])
