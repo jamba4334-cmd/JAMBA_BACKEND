@@ -1319,20 +1319,32 @@ def manage_seller_products():
 def update_seller_product(product_id):
     if db is None: return jsonify({"error": "DB unavailable"}), 503
     doc_ref = db.collection("products").document(product_id)
-    if doc_ref.get().to_dict().get("sellerEmail") != request.seller_email:
+    doc_snap = doc_ref.get()
+    if not doc_snap.exists or doc_snap.to_dict().get("sellerEmail") != request.seller_email:
         return jsonify({"error": "Forbidden"}), 403
         
+    old_product = doc_snap.to_dict()
     data = request.get_json()
     
-    # SECURITY FIX: Prevent sellers from unblocking their own products via the API
-    data.pop("approval_status", None)
+    # Prevent tampering with blocked reasons directly without editing
     data.pop("blocked_reason", None)
     
+    # 🔥 RESUBMISSION LOGIC: If product was blocked or rejected, editing re-submits it for approval!
+    is_resubmission = old_product.get("approval_status") in ["blocked", "rejected"]
+    if is_resubmission:
+        data["approval_status"] = "pending"
+        data["blocked_reason"] = None # Clear old block note upon re-submission
+    else:
+        data.pop("approval_status", None) # Prevent normal sellers from altering approval status
+
     # 🔥 Generate Audit Event 🔥
     action = "edited"
     details = "Seller updated product details"
     
-    if "isDeleted" in data:
+    if is_resubmission:
+        action = "resubmitted"
+        details = "Seller edited and re-submitted product for admin approval"
+    elif "isDeleted" in data:
         action = "soft_delete" if data["isDeleted"] else "restore"
         details = f"Seller {'archived' if data['isDeleted'] else 'restored'} the product"
     elif "isHidden" in data:
@@ -1353,23 +1365,6 @@ def update_seller_product(product_id):
     update_payload = {**data, "audit_history": firestore.ArrayUnion([audit_entry])}
     doc_ref.update(update_payload)
     return jsonify({"status": "success"}), 200
-
-@app.route("/api/v1/seller/reviews", methods=["GET"])
-@seller_required
-def get_seller_reviews():
-    if db is None: return jsonify({"error": "DB unavailable"}), 503
-    try:
-        reviews = []
-        for doc in db.collection("reviews").where("sellerEmail", "==", request.seller_email).get():
-            r = doc.to_dict()
-            r["id"] = doc.id
-            if "createdAt" in r and hasattr(r["createdAt"], "isoformat"):
-                r["createdAt"] = r["createdAt"].isoformat()
-            reviews.append(r)
-        return jsonify(reviews), 200
-    except Exception as e:
-        logger.error(f"Error fetching seller reviews: {str(e)}", exc_info=True)
-        return jsonify({"error": "Internal server error"}), 500
 
 @app.route("/api/v1/seller/reviews/<review_id>/reply", methods=["POST"])
 @seller_required
