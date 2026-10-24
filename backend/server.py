@@ -2406,7 +2406,7 @@ def master_admin_user_detail(admin_id):
     if request.admin_email != ALLOWED_ADMIN_EMAIL:
         return jsonify({"error": "Forbidden"}), 403
         
-    admin_ref = db.collection("admin_users").document(v_email(admin_id))
+    admin_ref = db.collection("admin_users").document(v_doc_id(admin_id))
     if request.method == "PUT":
         data = request.get_json() or {}
         if "permissions" in data and isinstance(data["permissions"], dict):
