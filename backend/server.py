@@ -64,6 +64,15 @@ app.config["MAX_CONTENT_LENGTH"] = 6 * 1024 * 1024  # 6 MB ceiling (avatar endpo
 
 ALLOWED_ADMIN_EMAIL = (os.getenv("ADMIN_EMAIL") or "").strip().lower()
 
+def is_master_admin_email(email):
+    if not email: return False
+    e = str(email).strip().lower()
+    masters = [x.strip().lower() for x in (os.getenv("ADMIN_EMAIL") or "").split(",") if x.strip()]
+    for known in ["jamba4334@gmail.com", "marcelbasumatary5@gmail.com"]:
+        if known not in masters:
+            masters.append(known)
+    return e in masters
+
 # ==========================================
 # INPUT VALIDATION HELPERS
 # ==========================================
@@ -216,7 +225,7 @@ def admin_required(f):
         if not decoded: return jsonify({"error": "Unauthorized"}), 401
         email = decoded.get("email", "").lower()
         if db is None: return jsonify({"error": "Service unavailable"}), 503
-        if ALLOWED_ADMIN_EMAIL and email == ALLOWED_ADMIN_EMAIL:
+        if is_master_admin_email(email):
             request.admin_email = email
             request.is_master = True
             request.admin_profile = {"name": "Master Admin", "employeeId": "JB-MASTER-001", "role": "Super Admin", "department": "Headquarters"}
@@ -744,7 +753,7 @@ def generate_invoice(order_id):
         
         is_admin = False
         if req_email:
-            if ALLOWED_ADMIN_EMAIL and req_email == ALLOWED_ADMIN_EMAIL: is_admin = True
+            if is_master_admin_email(req_email): is_admin = True
             else:
                 admin_doc = db.collection("admin_users").document(req_email).get()
                 if admin_doc.exists and admin_doc.to_dict().get("isAuthorized") is True: is_admin = True
@@ -1032,7 +1041,7 @@ def admin_session_status():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     admin_email = request.admin_email
     
-    if ALLOWED_ADMIN_EMAIL and admin_email == ALLOWED_ADMIN_EMAIL:
+    if is_master_admin_email(admin_email):
         master_doc = db.collection("admin_users").document(admin_email).get()
         master_data = master_doc.to_dict() if master_doc.exists else {}
         return jsonify({
@@ -2331,7 +2340,7 @@ def generate_next_employee_id():
 @admin_required
 def master_admin_users():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
-    if request.admin_email != ALLOWED_ADMIN_EMAIL:
+    if not is_master_admin_email(request.admin_email):
         return jsonify({"error": "Forbidden"}), 403
         
     if request.method == "GET":
@@ -2403,7 +2412,7 @@ def master_admin_users():
 @admin_required
 def master_admin_user_detail(admin_id):
     if db is None: return jsonify({"error": "Database unavailable"}), 503
-    if request.admin_email != ALLOWED_ADMIN_EMAIL:
+    if not is_master_admin_email(request.admin_email):
         return jsonify({"error": "Forbidden"}), 403
         
     admin_ref = db.collection("admin_users").document(v_doc_id(admin_id))
@@ -2443,7 +2452,7 @@ def master_admin_user_detail(admin_id):
 @admin_required
 def master_admin_logs():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
-    if request.admin_email != ALLOWED_ADMIN_EMAIL:
+    if not is_master_admin_email(request.admin_email):
         return jsonify({"error": "Forbidden"}), 403
         
     email = request.args.get("email")
