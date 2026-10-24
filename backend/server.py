@@ -62,16 +62,16 @@ CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}},
 
 app.config["MAX_CONTENT_LENGTH"] = 6 * 1024 * 1024  # 6 MB ceiling (avatar endpoint enforces 5 MB itself)
 
-ALLOWED_ADMIN_EMAIL = (os.getenv("ADMIN_EMAIL") or "").strip().lower()
+# ==========================================
+# MASTER SUPER ADMIN CONFIGURATION
+# ==========================================
+MASTER_SUPER_ADMIN = (os.getenv("ADMIN_EMAIL") or "jamba4334@gmail.com").strip().lower()
+ALLOWED_ADMIN_EMAIL = MASTER_SUPER_ADMIN
 
 def is_master_admin_email(email):
+    """Strictly checks if the email matches the single Master Super Admin."""
     if not email: return False
-    e = str(email).strip().lower()
-    masters = [x.strip().lower() for x in (os.getenv("ADMIN_EMAIL") or "").split(",") if x.strip()]
-    for known in ["jamba4334@gmail.com", "marcelbasumatary5@gmail.com"]:
-        if known not in masters:
-            masters.append(known)
-    return e in masters
+    return str(email).strip().lower() == MASTER_SUPER_ADMIN
 
 # ==========================================
 # INPUT VALIDATION HELPERS
@@ -386,9 +386,20 @@ def admin_upload_avatar():
     data = file.read()
     if len(data) > MAX_BYTES:
         return jsonify({"error": "File exceeds the 5 MB limit."}), 413
+    if len(data) < 16:
+        return jsonify({"error": "Corrupt or empty image file."}), 400
 
-    # Build a unique path inside the bucket
-    unique_name = f"{uuid.uuid4().hex}{ext}"
+    # Strict Magic Bytes Validation (prevents SVG XSS and disguised scripts)
+    is_png = data.startswith(b"\x89PNG\r\n\x1a\n")
+    is_jpeg = data.startswith(b"\xff\xd8\xff")
+    if not (is_png or is_jpeg):
+        return jsonify({"error": "Security Check Failed: File is not a valid PNG or JPG/JPEG image."}), 415
+
+    # Safe Extension normalization
+    safe_ext = ".png" if is_png else ".jpg"
+
+    # Build an unguessable unique path inside the bucket
+    unique_name = f"{uuid.uuid4().hex}{safe_ext}"
     file_path   = f"avatars/{unique_name}"
 
     supabase_url    = os.getenv("SUPABASE_URL", "").rstrip("/")
@@ -2341,7 +2352,7 @@ def generate_next_employee_id():
 def master_admin_users():
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     if not is_master_admin_email(request.admin_email):
-        return jsonify({"error": "Forbidden"}), 403
+        return jsonify({"error": "Forbidden: Master Super Admin access required."}), 403
         
     if request.method == "GET":
         users = [{**doc.to_dict(), "id": doc.id} for doc in db.collection("admin_users").get()]
@@ -2349,13 +2360,26 @@ def master_admin_users():
         
     if request.method == "POST":
         data = request.get_json() or {}
-        email = v_email(data.get("email"))
+        raw_email = str(data.get("email") or "").strip().lower()
+        email = v_email(raw_email)
+
+        # SELF-PRESERVATION: Master Super Admin cannot be overwritten via onboarding
+        if email == MASTER_SUPER_ADMIN:
+            return jsonify({"error": "Cannot overwrite Master Super Admin account."}), 400
         
         existing_doc = db.collection("admin_users").document(email).get()
         existing_data = existing_doc.to_dict() if existing_doc.exists else {}
         
         emp_id = existing_data.get("employeeId") or generate_next_employee_id()
-        name = data.get("name") or data.get("fullName") or f"{data.get('firstName', '')} {data.get('lastName', '')}".strip() or email.split("@")[0]
+        name = v_str(data.get("name") or data.get("fullName") or email.split("@")[0], max_len=100, field="name")
+        role = v_str(data.get("role") or "Operations Admin", max_len=100, field="role")
+        department = v_str(data.get("department") or "Operations", max_len=100, field="department")
+        gender = str(data.get("gender") or "Not Specified")[:30]
+        phone = str(data.get("phone") or "")[:25]
+        whatsapp = str(data.get("whatsapp") or "")[:25]
+        avatar_url = str(data.get("avatarUrl") or "").strip()
+        if avatar_url and not (avatar_url.startswith("https://") or avatar_url.startswith("http://")):
+            avatar_url = ""
         
         default_permissions = {
             "live-products": True,
@@ -2374,26 +2398,27 @@ def master_admin_users():
             "master-control": False
         }
         permissions = data.get("permissions") if isinstance(data.get("permissions"), dict) else default_permissions
+        # CRITICAL: Prevent privilege escalation
         permissions["master-control"] = False
 
         doc_data = {
             "email": email,
             "name": name,
             "employeeId": emp_id,
-            "gender": data.get("gender", "Not Specified"),
-            "role": data.get("role", "Operations Admin"),
-            "department": data.get("department", "Operations"),
-            "phone": data.get("phone", ""),
-            "whatsapp": data.get("whatsapp", ""),
-            "avatarUrl": data.get("avatarUrl", ""),
+            "gender": gender,
+            "role": role,
+            "department": department,
+            "phone": phone,
+            "whatsapp": whatsapp,
+            "avatarUrl": avatar_url,
             "joiningDate": data.get("joiningDate") or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
             "permissions": permissions,
-            "isAuthorized": data.get("isAuthorized", True),
+            "isAuthorized": bool(data.get("isAuthorized", True)),
             "isOnline": False,
             "forceLogout": False,
-            "accessStartTime": data.get("accessStartTime", "00:00"),
-            "accessEndTime": data.get("accessEndTime", "23:59"),
-            "maxDuration": data.get("maxDuration", 60),
+            "accessStartTime": str(data.get("accessStartTime", "00:00"))[:5],
+            "accessEndTime": str(data.get("accessEndTime", "23:59"))[:5],
+            "maxDuration": min(max(int(data.get("maxDuration") or 60), 0), 1440),
             "createdAt": existing_data.get("createdAt") or datetime.now(timezone.utc).isoformat(),
             "updatedAt": datetime.now(timezone.utc).isoformat()
         }
@@ -2402,7 +2427,7 @@ def master_admin_users():
         
         log_admin_action(
             action="EMPLOYEE_CREATE",
-            details=f"Onboarded employee {name} ({emp_id}) with department '{doc_data['department']}' and role '{doc_data['role']}'.",
+            details=f"Onboarded employee {name} ({emp_id}) with department '{department}' and role '{role}'.",
             target_type="employee",
             target_id=email
         )
@@ -2413,31 +2438,74 @@ def master_admin_users():
 def master_admin_user_detail(admin_id):
     if db is None: return jsonify({"error": "Database unavailable"}), 503
     if not is_master_admin_email(request.admin_email):
-        return jsonify({"error": "Forbidden"}), 403
+        return jsonify({"error": "Forbidden: Master Super Admin access required."}), 403
         
-    admin_ref = db.collection("admin_users").document(v_doc_id(admin_id))
+    safe_admin_id = v_doc_id(admin_id)
+    target_email = safe_admin_id.strip().lower()
+
+    # SELF-PRESERVATION: Master Super Admin cannot be deleted
+    if target_email == MASTER_SUPER_ADMIN and request.method == "DELETE":
+        return jsonify({"error": "Security Restriction: Cannot delete the Master Super Admin account."}), 400
+
+    admin_ref = db.collection("admin_users").document(safe_admin_id)
+
     if request.method == "PUT":
         data = request.get_json() or {}
-        if "permissions" in data and isinstance(data["permissions"], dict):
-            data["permissions"]["master-control"] = False
-        data["updatedAt"] = datetime.now(timezone.utc).isoformat()
-        admin_ref.set(data, merge=True)
+
+        # SELF-PRESERVATION: Master Super Admin cannot be revoked or force-logged out
+        if target_email == MASTER_SUPER_ADMIN:
+            if data.get("isAuthorized") is False or data.get("forceLogout") is True:
+                return jsonify({"error": "Security Restriction: Cannot revoke or terminate Master Super Admin session."}), 400
+
+        # Whitelist permitted update fields (prevents mass assignment / property injection)
+        ALLOWED_UPDATE_FIELDS = {
+            "name", "gender", "role", "department", "phone", "whatsapp",
+            "avatarUrl", "accessStartTime", "accessEndTime", "maxDuration",
+            "isAuthorized", "forceLogout", "permissions"
+        }
+        safe_data = {k: v for k, v in data.items() if k in ALLOWED_UPDATE_FIELDS}
+
+        # Strict privilege escalation prevention
+        if "permissions" in safe_data and isinstance(safe_data["permissions"], dict):
+            safe_data["permissions"]["master-control"] = False
+
+        # Input sanitization
+        if "name" in safe_data: safe_data["name"] = v_str(safe_data["name"], max_len=100, field="name")
+        if "role" in safe_data: safe_data["role"] = v_str(safe_data["role"], max_len=100, field="role")
+        if "department" in safe_data: safe_data["department"] = v_str(safe_data["department"], max_len=100, field="department")
+        if "phone" in safe_data: safe_data["phone"] = str(safe_data["phone"])[:25]
+        if "whatsapp" in safe_data: safe_data["whatsapp"] = str(safe_data["whatsapp"])[:25]
+        if "avatarUrl" in safe_data:
+            url = str(safe_data["avatarUrl"]).strip()
+            safe_data["avatarUrl"] = url if (url.startswith("https://") or url.startswith("http://")) else ""
+
+        safe_data["updatedAt"] = datetime.now(timezone.utc).isoformat()
+        admin_ref.set(safe_data, merge=True)
         
-        target_name = data.get("name") or admin_id
-        action_type = "ACCESS_UPDATE" if "permissions" in data else "EMPLOYEE_UPDATE"
-        details = f"Updated access permissions for {target_name}" if "permissions" in data else f"Updated employee profile for {target_name}"
+        target_name = safe_data.get("name") or safe_admin_id
+        action_type = "ACCESS_UPDATE" if "permissions" in safe_data else "EMPLOYEE_UPDATE"
+        details = f"Updated access permissions for {target_name}" if "permissions" in safe_data else f"Updated employee profile for {target_name}"
         log_admin_action(
             action=action_type,
             details=details,
             target_type="employee",
-            target_id=admin_id
+            target_id=safe_admin_id
         )
         return jsonify({"status": "success"}), 200
         
     if request.method == "DELETE":
         doc_snap = admin_ref.get()
         doc_data = doc_snap.to_dict() if doc_snap.exists else {}
-        emp_name = doc_data.get("name") or admin_id
+        emp_name = doc_data.get("name") or safe_admin_id
+        emp_id = doc_data.get("employeeId", "")
+        admin_ref.delete()
+        log_admin_action(
+            action="EMPLOYEE_DELETE",
+            details=f"Revoked all access and permanently deleted employee {emp_name} ({emp_id}).",
+            target_type="employee",
+            target_id=safe_admin_id
+        )
+        return jsonify({"status": "success"}), 200
         emp_id = doc_data.get("employeeId", "")
         admin_ref.delete()
         log_admin_action(
